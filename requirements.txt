@@ -1,4 +1,3 @@
-python-telegram-bot==20.7
-ephem
+python-telegram-bot==20.9ephem
 geopy
 httpx
