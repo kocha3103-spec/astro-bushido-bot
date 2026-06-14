@@ -2,7 +2,7 @@ import logging
 import httpx
 import swisseph as swe
 from geopy.geocoders import Nominatim
-from timezonefinder import TimezoneFinder
+from tzfpy import get_tz
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -25,8 +25,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SIGNS = ["Овен","Телец","Близнецы","Рак","Лев","Дева","Весы","Скорпион","Стрелец","Козерог","Водолей","Рыбы"]
-
-tf = TimezoneFinder()
 
 
 def fmt_position(lon):
@@ -69,7 +67,7 @@ def calculate_natal_chart(birth_date, birth_time, city):
             return {"error": f"Не удалось найти город: {city}"}
 
         # Часовой пояс по координатам (с историей переходов времени)
-        tzname = tf.timezone_at(lat=lat, lng=lon_geo)
+        tzname = get_tz(lon_geo, lat)
         if not tzname:
             return {"error": "Не удалось определить часовой пояс"}
 
