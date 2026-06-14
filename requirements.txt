@@ -1,4 +1,5 @@
 python-telegram-bot==21.10
-ephem
+pyswisseph
+timezonefinder
 geopy
 httpx

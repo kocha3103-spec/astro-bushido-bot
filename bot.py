@@ -1,8 +1,10 @@
 import logging
 import httpx
-import ephem
+import swisseph as swe
 from geopy.geocoders import Nominatim
+from timezonefinder import TimezoneFinder
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -24,6 +26,30 @@ logger = logging.getLogger(__name__)
 
 SIGNS = ["Овен","Телец","Близнецы","Рак","Лев","Дева","Весы","Скорпион","Стрелец","Козерог","Водолей","Рыбы"]
 
+tf = TimezoneFinder()
+
+
+def fmt_position(lon):
+    """Долгота -> 'Знак градус°'"""
+    lon = lon % 360
+    return SIGNS[int(lon / 30)], round(lon % 30, 1)
+
+
+def get_house(planet_lon, cusps):
+    """Определить дом планеты по куспидам Плацидуса"""
+    planet_lon = planet_lon % 360
+    for i in range(12):
+        c1 = cusps[i] % 360
+        c2 = cusps[(i + 1) % 12] % 360
+        if c1 <= c2:
+            if c1 <= planet_lon < c2:
+                return i + 1
+        else:  # переход через 0° Овна
+            if planet_lon >= c1 or planet_lon < c2:
+                return i + 1
+    return 1
+
+
 def get_coordinates(city_name):
     try:
         geolocator = Nominatim(user_agent="astro_bushido_bot")
@@ -34,84 +60,207 @@ def get_coordinates(city_name):
     except Exception:
         return None, None
 
-def get_sign(lon_deg):
-    lon_deg = lon_deg % 360
-    return SIGNS[int(lon_deg / 30)], round(lon_deg % 30, 1)
 
 def calculate_natal_chart(birth_date, birth_time, city):
+    """Натальная карта: Swiss Ephemeris + дома Плацидуса + автоопределение часового пояса"""
     try:
-        lat, lon = get_coordinates(city)
+        lat, lon_geo = get_coordinates(city)
         if lat is None:
             return {"error": f"Не удалось найти город: {city}"}
 
-        dt = datetime.strptime(f"{birth_date} {birth_time}", "%d.%m.%Y %H:%M")
+        # Часовой пояс по координатам (с историей переходов времени)
+        tzname = tf.timezone_at(lat=lat, lng=lon_geo)
+        if not tzname:
+            return {"error": "Не удалось определить часовой пояс"}
 
-        observer = ephem.Observer()
-        observer.lat = str(lat)
-        observer.lon = str(lon)
-        observer.date = dt.strftime("%Y/%m/%d %H:%M:%S")
-        observer.epoch = ephem.J2000
+        local_dt = datetime.strptime(f"{birth_date} {birth_time}", "%d.%m.%Y %H:%M")
+        local_dt = local_dt.replace(tzinfo=ZoneInfo(tzname))
+        utc = local_dt.astimezone(ZoneInfo("UTC"))
 
-        planets_list = {
-            "Солнце": ephem.Sun(observer),
-            "Луна": ephem.Moon(observer),
-            "Меркурий": ephem.Mercury(observer),
-            "Венера": ephem.Venus(observer),
-            "Марс": ephem.Mars(observer),
-            "Юпитер": ephem.Jupiter(observer),
-            "Сатурн": ephem.Saturn(observer),
-            "Уран": ephem.Uranus(observer),
-            "Нептун": ephem.Neptune(observer),
-            "Плутон": ephem.Pluto(observer),
+        jd = swe.julday(utc.year, utc.month, utc.day, utc.hour + utc.minute / 60 + utc.second / 3600)
+
+        # Дома Плацидуса
+        cusps, ascmc = swe.houses(jd, lat, lon_geo, b'P')
+
+        planet_ids = {
+            "Солнце": swe.SUN, "Луна": swe.MOON, "Меркурий": swe.MERCURY,
+            "Венера": swe.VENUS, "Марс": swe.MARS, "Юпитер": swe.JUPITER,
+            "Сатурн": swe.SATURN, "Уран": swe.URANUS, "Нептун": swe.NEPTUNE,
+            "Плутон": swe.PLUTO,
         }
 
-        lst = float(observer.sidereal_time()) * 180 / 3.14159265
-        asc_lon = (lst + float(observer.lon) * 180 / 3.14159265) % 360
-        asc_sign, asc_deg = get_sign(asc_lon)
-
-        def get_house(planet_lon):
-            diff = (planet_lon % 360 - asc_lon) % 360
-            return int(diff / 30) + 1
-
         chart = {}
-        for name, planet in planets_list.items():
-            p_lon = float(planet.hlong) * 180 / 3.14159265
-            sign, degree = get_sign(p_lon)
-            house = get_house(p_lon)
-            chart[name] = f"{sign} {degree}°, {house} дом"
+        planet_lons = {}
+        retrograde = []  # список ретроградных планет
+        for name, pid in planet_ids.items():
+            res = swe.calc_ut(jd, pid)[0]
+            p_lon = res[0]
+            speed = res[3]  # скорость по долготе: <0 = ретроградная
+            planet_lons[name] = p_lon
+            sign, degree = fmt_position(p_lon)
+            house = get_house(p_lon, cusps)
+            is_retro = speed < 0
+            retro_mark = " ℞" if is_retro else ""
+            chart[name] = f"{sign} {degree}°, {house} дом{retro_mark}"
+            if is_retro:
+                retrograde.append((name, sign, degree, house))
 
+        asc_sign, asc_deg = fmt_position(ascmc[0])
+        mc_sign, mc_deg = fmt_position(ascmc[1])
         chart["Асцендент"] = f"{asc_sign} {asc_deg}°"
-        chart["Город"] = city
+        chart["MC"] = f"{mc_sign} {mc_deg}°"
+        chart["Город"] = f"{city} ({tzname})"
         chart["Дата"] = birth_date
-        chart["Время"] = birth_time
+        chart["Время"] = f"{birth_time} (местное)"
+        chart["_cusps"] = list(cusps)  # для расчёта домов лунаций
+        chart["_retrograde"] = retrograde  # для блока ретроградности
 
         return chart
     except Exception as e:
         return {"error": str(e)}
 
-def get_next_new_moon():
-    next_nm = ephem.next_new_moon(ephem.now())
-    dt = ephem.Date(next_nm).datetime()
-    obs = ephem.Observer()
-    obs.date = next_nm
-    moon = ephem.Moon(obs)
-    lon = float(moon.hlong) * 180 / 3.14159265
-    sign, degree = get_sign(lon)
-    return f"{dt.strftime('%d.%m.%Y')}, Луна в {sign} {degree}°"
 
-def get_last_full_moon():
-    last_fm = ephem.previous_full_moon(ephem.now())
-    dt = ephem.Date(last_fm).datetime()
-    obs = ephem.Observer()
-    obs.date = last_fm
-    moon = ephem.Moon(obs)
-    lon = float(moon.hlong) * 180 / 3.14159265
-    sign, degree = get_sign(lon)
-    return f"{dt.strftime('%d.%m.%Y')}, Луна в {sign} {degree}°"
+def get_moon_event(event_jd):
+    """Позиция Луны в момент лунации"""
+    moon_lon = swe.calc_ut(event_jd, swe.MOON)[0][0]
+    sign, degree = fmt_position(moon_lon)
+    y, m, d, h = swe.revjul(event_jd)
+    return moon_lon, f"{int(d):02d}.{int(m):02d}.{int(y)}", sign, degree
+
+
+def find_next_new_moon():
+    """Следующее новолуние (поиск по фазе)"""
+    now = datetime.utcnow()
+    jd = swe.julday(now.year, now.month, now.day, now.hour + now.minute / 60)
+    step = 0.5
+    prev_diff = None
+    for i in range(120):
+        t = jd + i * step
+        sun = swe.calc_ut(t, swe.SUN)[0][0]
+        moon = swe.calc_ut(t, swe.MOON)[0][0]
+        diff = (moon - sun) % 360
+        if prev_diff is not None and prev_diff > 300 and diff < 60:
+            # уточняем
+            lo, hi = t - step, t
+            for _ in range(50):
+                mid = (lo + hi) / 2
+                s = swe.calc_ut(mid, swe.SUN)[0][0]
+                m = swe.calc_ut(mid, swe.MOON)[0][0]
+                d = (m - s) % 360
+                if d > 300:
+                    lo = mid
+                else:
+                    hi = mid
+            return (lo + hi) / 2
+        prev_diff = diff
+    return None
+
+
+def find_prev_full_moon():
+    """Предыдущее полнолуние"""
+    now = datetime.utcnow()
+    jd = swe.julday(now.year, now.month, now.day, now.hour + now.minute / 60)
+    step = 0.5
+    prev_diff = None
+    for i in range(120):
+        t = jd - i * step
+        sun = swe.calc_ut(t, swe.SUN)[0][0]
+        moon = swe.calc_ut(t, swe.MOON)[0][0]
+        diff = (moon - sun) % 360
+        if prev_diff is not None and diff < 180 <= prev_diff:
+            lo, hi = t, t + step
+            for _ in range(50):
+                mid = (lo + hi) / 2
+                s = swe.calc_ut(mid, swe.SUN)[0][0]
+                m = swe.calc_ut(mid, swe.MOON)[0][0]
+                d = (m - s) % 360
+                if d < 180:
+                    lo = mid
+                else:
+                    hi = mid
+            return (lo + hi) / 2
+        prev_diff = diff
+    return None
+
+
+async def get_retrograde_block(name, retrograde):
+    """Отдельный блок про ретроградные планеты (Меркурий/Венера/Марс) — бонус-фича"""
+    # Берём только личные планеты — они дают самое заметное 'не как у всех'
+    personal = [r for r in retrograde if r[0] in ("Меркурий", "Венера", "Марс")]
+    if not personal:
+        return None
+
+    retro_list = "\n".join([f"  {n}: {s} {d}°, {h} дом ℞" for n, s, d, h in personal])
+
+    system_prompt = """Ты астролог Екатерина. Пишешь блок про РЕТРОГРАДНЫЕ планеты в натальной карте.
+
+ТВОЙ ВЗГЛЯД НА РЕТРОГРАДНОСТЬ (это ключевое):
+- Ретроградная планета УСИЛЕНА, а не сломана — в момент рождения она была ближе всего к Земле, её энергия концентрированная
+- Она работает ВНУТРЬ, а не наружу: тема переживается глубже, интенсивнее, более лично
+- Это скрытая суперсила, которую сам человек обычно считает своей слабостью
+- Человеку с ретро-планетой нужно больше времени, он обрабатывает иначе — и в этом его особость, а не дефект
+- Это то, что отличает его от людей без ретроградности — тихая особенность, которая есть не у всех
+
+ЧТО ОЗНАЧАЕТ КАЖДАЯ:
+- Меркурий ℞: мышление и речь работают внутрь — человек думает глубже, переосмысляет, ему нужно проговорить про себя прежде чем вовне. Часто кажется, что «медленно соображает», а на деле обрабатывает глубже всех.
+- Венера ℞: любовь и ценности переживаются внутрь — нестандартное отношение к близости, деньгам, красоте. Человек любит иначе, ценит иначе, ему сложно с шаблонной романтикой.
+- Марс ℞: действие и желание развёрнуты внутрь — энергия не выплёскивается сразу, копится. Кажется слабостью («не могу пробить, не агрессивный»), но это стратегическая, выдержанная сила.
+
+ФОРМАТ:
+- По-русски, тепло, обращайся по имени
+- Подай как ВАУ-бонус, скрытую особенность
+- Знак + градус + дом для каждой
+- 2-3 абзаца, не больше"""
+
+    user_prompt = f"""Имя: {name}
+
+Ретроградные личные планеты в карте:
+{retro_list}
+
+Напиши тёплый, глубокий блок про эти ретроградные планеты как про скрытую суперсилу этого человека. Покажи, чем он отличается от людей без ретроградности."""
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                HYDRA_API_URL,
+                headers={
+                    "Authorization": f"Bearer {HYDRA_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": MODEL,
+                    "max_tokens": 800,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ]
+                }
+            )
+            data = response.json()
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+    except Exception:
+        pass
+    return None
+
 
 async def get_astro_forecast(name, chart):
-    new_moon = get_next_new_moon()
-    full_moon = get_last_full_moon()
+    cusps = chart.pop("_cusps", None)
+    chart.pop("_retrograde", None)  # убираем служебное поле из текста карты
+
+    nm_jd = find_next_new_moon()
+    fm_jd = find_prev_full_moon()
+
+    nm_text, fm_text = "", ""
+    if nm_jd and cusps:
+        moon_lon, date_s, sign, deg = get_moon_event(nm_jd)
+        house = get_house(moon_lon, cusps)
+        nm_text = f"{date_s}, Луна в {sign} {deg}°, попадает в {house} дом натальной карты"
+    if fm_jd and cusps:
+        moon_lon, date_s, sign, deg = get_moon_event(fm_jd)
+        house = get_house(moon_lon, cusps)
+        fm_text = f"{date_s}, Луна в {sign} {deg}°, попадает в {house} дом натальной карты"
+
     chart_text = "\n".join([f"  {k}: {v}" for k, v in chart.items()])
 
     system_prompt = """Ты астрологический ассистент по методологии Екатерины.
@@ -120,24 +269,24 @@ async def get_astro_forecast(name, chart):
 1. Всегда указывай: знак зодиака + градус + номер дома (например: Луна в Близнецах 24°, 7 дом)
 2. Астрология — язык энергетических взаимодействий, не предсказание
 3. Интерпретация идёт от реальных событий жизни к карте
-4. Транзиты подтверждают тренды которые уже идут
-5. Смотри на взаимодействие планет
+4. Лунации завершают/запускают тренды которые уже идут — они не создают события с нуля
+5. Смотри на взаимодействие лунации с натальными планетами: если лунация близко к натальной планете (орб до 6°) — обязательно укажи это соединение
 
 ФОРМАТ:
 - По-русски, тепло и глубоко
 - Обращайся по имени
-- Знак + градус + дом всегда
+- Знак + градус + дом всегда — дома лунаций уже рассчитаны точно, используй именно их
 - 4-5 абзацев максимум"""
 
     user_prompt = f"""Имя: {name}
 
-Натальная карта:
+Натальная карта (дома Плацидуса, рассчитано Swiss Ephemeris):
 {chart_text}
 
-Следующее новолуние: {new_moon}
-Предыдущее полнолуние: {full_moon}
+Предыдущее полнолуние: {fm_text}
+Следующее новолуние: {nm_text}
 
-Составь персональный прогноз по лунациям. Укажи в каком доме натальной карты происходит каждое событие."""
+Составь персональный прогноз по этим лунациям. Дом каждой лунации уже указан точно — опирайся на него. Проверь соединения лунаций с натальными планетами."""
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -164,6 +313,7 @@ async def get_astro_forecast(name, chart):
     except Exception as e:
         return f"Ошибка подключения: {str(e)}"
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "🌙 Привет! Я Astro Bushido Bot.\n\n"
@@ -171,6 +321,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Как тебя зовут?"
     )
     return NAME
+
 
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["name"] = update.message.text.strip()
@@ -182,6 +333,7 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     )
     return CONSENT
+
 
 async def get_consent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if "Да" in update.message.text:
@@ -197,6 +349,7 @@ async def get_consent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
         return ConversationHandler.END
 
+
 async def get_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     date_text = update.message.text.strip()
     try:
@@ -211,8 +364,9 @@ async def get_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Неверный формат. Введи дату так: ДД.ММ.ГГГГ\nНапример: 31.03.1997")
         return BIRTH_DATE
 
+
 async def get_birth_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    time_text = update.message.text.strip()
+    time_text = update.message.text.strip().replace(".", ":")
     try:
         datetime.strptime(time_text, "%H:%M")
         context.user_data["birth_time"] = time_text
@@ -222,9 +376,9 @@ async def get_birth_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Неверный формат. Введи время так: ЧЧ:ММ\nНапример: 23:48")
         return BIRTH_TIME
 
+
 async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     city = update.message.text.strip()
-    context.user_data["birth_city"] = city
     name = context.user_data["name"]
 
     await update.message.reply_text(f"✨ Считаю натальную карту для {name}...\n\nЭто займёт несколько секунд 🔮")
@@ -238,20 +392,34 @@ async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if "error" in chart:
         await update.message.reply_text(
             f"Не удалось рассчитать карту: {chart['error']}\n"
-            "Попробуй написать город по-английски или начни заново /start"
+            "Попробуй написать город иначе или начни заново /start"
         )
         return ConversationHandler.END
+
+    # Достаём ретро ДО того как get_astro_forecast очистит служебные поля
+    retrograde = chart.get("_retrograde", [])
 
     await update.message.reply_text("🌙 Запрашиваю прогноз у звёзд...")
     forecast = await get_astro_forecast(name, chart)
     await update.message.reply_text(forecast)
+
+    # Бонус-блок: ретроградные планеты (если есть личные ретро)
+    retro_block = await get_retrograde_block(name, retrograde)
+    if retro_block:
+        await update.message.reply_text(
+            "⚡️ <b>Твоя скрытая особенность — ретроградные планеты</b>\n\n" + retro_block,
+            parse_mode="HTML"
+        )
+
     await update.message.reply_text("🌟 Если хочешь новый прогноз — напиши /start")
 
     return ConversationHandler.END
 
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Отменено. Напиши /start чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -267,8 +435,9 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv_handler)
-    print("🌙 Astro Bushido Bot запущен!")
+    print("🌙 Astro Bushido Bot запущен (Swiss Ephemeris + Placidus)!")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
