@@ -1,4 +1,5 @@
 import logging
+import os
 import httpx
 import swisseph as swe
 from geopy.geocoders import Nominatim
@@ -14,8 +15,8 @@ from telegram.ext import (
 # ========================
 # НАСТРОЙКИ
 # ========================
-TELEGRAM_TOKEN = "8505031201:AAFu5Y0R9hzYkAMTPP1McRbvKUz02ENMBHA"
-HYDRA_API_KEY = "sk-hydra-ai-H8xe9tWhpBerfw8uOGv8ylvFMEDgS7hIqna7npENOQaPHL0Y_do2TTq6n_k0_vOv"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+HYDRA_API_KEY = os.environ.get("HYDRA_API_KEY", "")
 HYDRA_API_URL = "https://api.hydraai.ru/v1/chat/completions"
 MODEL = "claude-opus-4.6"
 
