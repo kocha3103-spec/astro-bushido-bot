@@ -3,3 +3,5 @@ pyswisseph
 tzfpy
 geopy
 httpx
+yookassa
+chromadb-client
