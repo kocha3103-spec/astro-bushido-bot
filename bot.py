@@ -7,6 +7,9 @@ from geopy.geocoders import Nominatim
 from tzfpy import get_tz
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from uuid import uuid4
+from yookassa import Configuration, Payment as YooPayment
+from retrieval import retrieve, build_query
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -15,12 +18,40 @@ from telegram.ext import (
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 HYDRA_API_KEY = os.environ["HYDRA_API_KEY"]
+YOOKASSA_SHOP_ID = os.environ["YOOKASSA_SHOP_ID"]
+YOOKASSA_SECRET = os.environ["YOOKASSA_SECRET"]
 HYDRA_API_URL = "https://api.hydraai.ru/v1/chat/completions"
 MODEL = "claude-opus-4.6"
 USER_DATA_FILE = "user_data.json"
-COMMUNITY_LINK = "https://t.me/astro_bushido_bot"  # заглушка
+COMMUNITY_LINK = "https://t.me/astro_bushido_bot"  # заменить на реальную ссылку
+PRIVACY_POLICY_URL = "https://telegra.ph/privacy-astro-bushido"  # заменить после публикации
+
+Configuration.account_id = YOOKASSA_SHOP_ID
+Configuration.secret_key = YOOKASSA_SECRET
+
+SUBSCRIPTION_PLANS = {
+    "mercury_year": {
+        "name": "☿ Все Меркурии на год",
+        "desc": "Персональный разбор каждого ретроградного Меркурия 2026 — все периоды сразу.",
+        "price": "990.00",
+        "label": "990 ₽",
+    },
+    "planets_year": {
+        "name": "🪐 Все ретроградные планеты",
+        "desc": "Венера, Марс, Юпитер, Сатурн и другие — персональный разбор на весь год.",
+        "price": "1990.00",
+        "label": "1 990 ₽",
+    },
+    "full_year": {
+        "name": "✨ Полный годовой прогноз",
+        "desc": "Все фазы луны + все ретроградности + транзиты на 2026.",
+        "price": "3990.00",
+        "label": "3 990 ₽",
+    },
+}
 
 NAME, CONSENT, BIRTH_DATE, BIRTH_TIME, BIRTH_CITY, MAIN_MENU, CHOOSE_LUNATION = range(7)
+LUNATIONS_PER_PAGE = 8
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +59,9 @@ logger = logging.getLogger(__name__)
 SIGNS = ["Овен","Телец","Близнецы","Рак","Лев","Дева","Весы","Скорпион","Стрелец","Козерог","Водолей","Рыбы"]
 SIGNS_EMOJI = {"Овен":"♈","Телец":"♉","Близнецы":"♊","Рак":"♋","Лев":"♌","Дева":"♍",
                "Весы":"♎","Скорпион":"♏","Стрелец":"♐","Козерог":"♑","Водолей":"♒","Рыбы":"♓"}
+
+_LUNATIONS_CACHE = None
+_LUNATIONS_CACHE_DATE = None
 
 
 # ========================
@@ -51,6 +85,53 @@ def save_user(user_id, user_info):
     data = load_user_data()
     data[str(user_id)] = user_info
     save_user_data(data)
+
+def has_subscription(user_id, plan_key):
+    user = get_user(user_id)
+    if not user:
+        return False
+    return user.get("subscriptions", {}).get(plan_key, False)
+
+def grant_subscription(user_id, plan_key):
+    data = load_user_data()
+    uid = str(user_id)
+    if uid not in data:
+        data[uid] = {}
+    if "subscriptions" not in data[uid]:
+        data[uid]["subscriptions"] = {}
+    data[uid]["subscriptions"][plan_key] = True
+    save_user_data(data)
+
+
+# ========================
+# ЮКАССА — СОЗДАНИЕ ПЛАТЕЖА
+# ========================
+def create_payment(user_id: int, plan_key: str) -> dict | None:
+    plan = SUBSCRIPTION_PLANS.get(plan_key)
+    if not plan:
+        return None
+    try:
+        payment = YooPayment.create({
+            "amount": {"value": plan["price"], "currency": "RUB"},
+            "confirmation": {
+                "type": "redirect",
+                "return_url": f"https://t.me/astro_bushido_bot?start=paid_{plan_key}_{user_id}",
+            },
+            "capture": True,
+            "description": f"{plan['name']} — Astro Bushido Bot",
+            "metadata": {"user_id": str(user_id), "plan_key": plan_key},
+        }, str(uuid4()))
+        return {"payment_id": payment.id, "url": payment.confirmation.confirmation_url}
+    except Exception as e:
+        logger.error(f"YooKassa error: {e}")
+        return None
+
+def check_payment(payment_id: str) -> bool:
+    try:
+        payment = YooPayment.find_one(payment_id)
+        return payment.status == "succeeded"
+    except Exception:
+        return False
 
 
 # ========================
@@ -129,16 +210,74 @@ def calculate_natal_chart(birth_date, birth_time, city):
     except Exception as e:
         return {"error": str(e)}
 
+def _refine_lunation(lo, hi, target):
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        d = (swe.calc_ut(mid, swe.MOON)[0][0] - swe.calc_ut(mid, swe.SUN)[0][0]) % 360
+        if target == 0:
+            if d > 300:
+                lo = mid
+            else:
+                hi = mid
+        else:
+            if d < 180:
+                lo = mid
+            else:
+                hi = mid
+    return (lo + hi) / 2
+
+def _lunation_info(jd):
+    moon_lon = swe.calc_ut(jd, swe.MOON)[0][0] % 360
+    sign, deg = fmt_position(moon_lon)
+    y, m, d, h = swe.revjul(jd)
+    return sign, deg, f"{int(d):02d}.{int(m):02d}.{int(y)}"
+
+def find_lunations_year():
+    global _LUNATIONS_CACHE, _LUNATIONS_CACHE_DATE
+    today = datetime.now(timezone.utc).date()
+    if _LUNATIONS_CACHE is not None and _LUNATIONS_CACHE_DATE == today:
+        return _LUNATIONS_CACHE
+
+    now = datetime.now(timezone.utc)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=400)
+    jd = swe.julday(start.year, start.month, start.day, 0)
+    jd_end = swe.julday(end.year, end.month, end.day, 0)
+
+    results = []
+    prev_diff = None
+    t = jd
+
+    while t < jd_end:
+        sun_lon = swe.calc_ut(t, swe.SUN)[0][0]
+        moon_lon = swe.calc_ut(t, swe.MOON)[0][0]
+        diff = (moon_lon - sun_lon) % 360
+
+        if prev_diff is not None:
+            if prev_diff > 300 and diff < 60:
+                nm_jd = _refine_lunation(t - 0.5, t, target=0)
+                sign, deg, date_str = _lunation_info(nm_jd)
+                results.append(("НЛ", date_str, sign, deg, nm_jd))
+            elif prev_diff < 180 <= diff:
+                fm_jd = _refine_lunation(t - 0.5, t, target=180)
+                sign, deg, date_str = _lunation_info(fm_jd)
+                results.append(("ПЛ", date_str, sign, deg, fm_jd))
+
+        prev_diff = diff
+        t += 0.5
+
+    results.sort(key=lambda x: x[4])
+    _LUNATIONS_CACHE = results
+    _LUNATIONS_CACHE_DATE = today
+    return results
+
 def find_mercury_retro():
-    """Найти ближайший ретроградный период Меркурия (текущий или будущий)"""
     now = datetime.now(timezone.utc)
     jd = swe.julday(now.year, now.month, now.day, now.hour + now.minute/60)
     speed_now = swe.calc_ut(jd, swe.MERCURY)[0][3]
-    
-    # Если сейчас уже ретро — ищем когда закончился и когда начался
+
     if speed_now < 0:
-        # Ищем начало (назад) и конец (вперёд)
-        # Начало
+        retro_start_jd = jd - 30
         t = jd
         for _ in range(60):
             t -= 1
@@ -146,7 +285,7 @@ def find_mercury_retro():
             if spd >= 0:
                 retro_start_jd = t
                 break
-        # Конец
+        retro_end_jd = None
         t = jd
         for _ in range(60):
             t += 1
@@ -156,7 +295,6 @@ def find_mercury_retro():
                 break
         is_current = True
     else:
-        # Ищем вперёд
         retro_start_jd = None
         retro_end_jd = None
         t = jd
@@ -196,48 +334,6 @@ def find_mercury_retro():
         "end_jd": retro_end_jd,
     }
 
-def find_lunations_around_now(weeks_back=3):
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(weeks=weeks_back)
-    jd_start = swe.julday(start.year, start.month, start.day, start.hour + start.minute/60)
-    results = {"НЛ": [], "ПЛ": []}
-    t = jd_start
-    prev_diff = None
-    for _ in range(300):
-        sun = swe.calc_ut(t, swe.SUN)[0][0]
-        moon = swe.calc_ut(t, swe.MOON)[0][0]
-        diff = (moon - sun) % 360
-        if prev_diff is not None:
-            if prev_diff > 300 and diff < 60 and len(results["НЛ"]) < 2:
-                lo, hi = t - 0.5, t
-                for _ in range(50):
-                    mid = (lo + hi) / 2
-                    d = (swe.calc_ut(mid, swe.MOON)[0][0] - swe.calc_ut(mid, swe.SUN)[0][0]) % 360
-                    if d > 300: lo = mid
-                    else: hi = mid
-                nm_jd = (lo + hi) / 2
-                moon_lon = swe.calc_ut(nm_jd, swe.MOON)[0][0] % 360
-                sign, deg = fmt_position(moon_lon)
-                y, mo, d, h = swe.revjul(nm_jd)
-                results["НЛ"].append((f"{int(d):02d}.{int(mo):02d}.{int(y)}", sign, deg, nm_jd))
-            if diff < 180 <= prev_diff and len(results["ПЛ"]) < 2:
-                lo, hi = t - 0.5, t
-                for _ in range(50):
-                    mid = (lo + hi) / 2
-                    d = (swe.calc_ut(mid, swe.MOON)[0][0] - swe.calc_ut(mid, swe.SUN)[0][0]) % 360
-                    if d < 180: lo = mid
-                    else: hi = mid
-                fm_jd = (lo + hi) / 2
-                moon_lon = swe.calc_ut(fm_jd, swe.MOON)[0][0] % 360
-                sign, deg = fmt_position(moon_lon)
-                y, mo, d, h = swe.revjul(fm_jd)
-                results["ПЛ"].append((f"{int(d):02d}.{int(mo):02d}.{int(y)}", sign, deg, fm_jd))
-        if len(results["НЛ"]) >= 2 and len(results["ПЛ"]) >= 2:
-            break
-        prev_diff = diff
-        t += 0.5
-    return results
-
 def get_moon_event_by_jd(event_jd, cusps):
     moon_lon = swe.calc_ut(event_jd, swe.MOON)[0][0] % 360
     sign, degree = fmt_position(moon_lon)
@@ -270,13 +366,13 @@ SYSTEM_ASTRO = """Ты — астролог Екатерина. Подход г�
 
 ⛔️ КРИТИЧЕСКИ ВАЖНО — НИКОГДА НЕ ВЫДУМЫВАЙ:
 • Используй ТОЛЬКО те планеты и дома, которые ЯВНО указаны в карте ниже. НЕ добавляй планеты в дома, где их нет.
-• Если планеты нет в доме лунации — так и говори, не придумывай несуществующие соединения.
-• Дом лунации указан точно — бери именно его, не пересчитывай.
+• Если планеты нет в доме фазы луны — так и говори, не придумывай несуществующие соединения.
+• Дом фазы луны указан точно — бери именно его, не пересчитывай.
 • Перед каждым утверждением «у тебя планета X в доме Y» — проверь, что это ТОЧНО есть в данных карты.
 
 ═══ ТВОЙ ВЗГЛЯД ═══
 • Астрология — язык энергий, не предсказание. Интерпретация идёт от событий жизни к карте.
-• Лунации завершают или запускают тренды, которые уже идут.
+• Фазы луны завершают или запускают тренды, которые уже идут.
 • НОВОЛУНИЕ — начало цикла, посев. ПОЛНОЛУНИЕ — кульминация, что завершается.
 
 ═══ ДОМА (кратко) ═══
@@ -290,27 +386,34 @@ SYSTEM_ASTRO = """Ты — астролог Екатерина. Подход г�
 
 ═══ ФОРМАТ (СТРОГО) ═══
 • По-русски, по имени.
-• КОРОТКО: максимум 3 абзаца на саму лунацию. Без воды.
+• КОРОТКО: максимум 3 абзаца на саму фазу луны. Без воды.
 • Знак + градус + дом — только реальные из карты.
 • В конце — 2-3 коротких вопроса для рефлексии на лунный месяц.
 • Весь ответ — не длиннее 4 абзацев + вопросы."""
 
 async def get_astro_forecast(name, chart, lunation_jd, lunation_type):
     cusps = chart.pop("_cusps", None)
-    chart.pop("_retrograde", None)
+    retrograde = chart.pop("_retrograde", None) or []
     chart.pop("_lat", None)
     chart.pop("_lon", None)
     moon_lon, date_s, sign, deg, house = get_moon_event_by_jd(lunation_jd, cusps)
     type_name = "🌑 Новолуние" if lunation_type == "НЛ" else "🌕 Полнолуние"
     lunation_text = f"{type_name} {date_s} — Луна в {sign} {deg}°, {house} дом"
     chart_text = "\n".join([f"  {k}: {v}" for k, v in chart.items()])
-    return await call_claude(SYSTEM_ASTRO, f"""Имя: {name}
+
+    # Ищем релевантные куски из авторских материалов
+    planet_names = [r[0] for r in retrograde] + list(chart.keys())[:4]
+    query = build_query(lunation_type, sign, house, planet_names)
+    source_context = retrieve(query)
+    sources_block = f"\n\n═══ АВТОРСКИЕ МАТЕРИАЛЫ (использовать в приоритете) ═══\n{source_context}" if source_context else ""
+
+    return await call_claude(SYSTEM_ASTRO + sources_block, f"""Имя: {name}
 Натальная карта (Плацидус, Swiss Ephemeris) — используй ТОЛЬКО эти данные, ничего не добавляй:
 {chart_text}
 
-Лунация: {lunation_text}
+Фаза луны: {lunation_text}
 
-Составь КОРОТКИЙ персональный разбор (максимум 3-4 абзаца). Упоминай только те планеты, что РЕАЛЬНО есть в доме/знаке лунации по данным карты. Если в доме лунации нет натальных планет — так и скажи. Заверши 2-3 вопросами для рефлексии.""", max_tokens=1400)
+Составь КОРОТКИЙ персональный разбор (максимум 3-4 абзаца). Упоминай только те планеты, что РЕАЛЬНО есть в доме/знаке фазы луны по данным карты. Если в доме фазы луны нет натальных планет — так и скажи. Заверши 2-3 вопросами для рефлексии.""", max_tokens=1400)
 
 async def get_retrograde_block(name, retrograde):
     personal = [r for r in retrograde if r[0] in ("Меркурий", "Венера", "Марс")]
@@ -335,7 +438,6 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
     if not cusps:
         return "Не удалось рассчитать дома."
 
-    # Определяем по каким домам пройдёт транзитный Меркурий
     start_lon = swe.calc_ut(retro_info["start_jd"], swe.MERCURY)[0][0]
     end_lon = swe.calc_ut(retro_info["end_jd"], swe.MERCURY)[0][0]
     start_house = get_house(start_lon % 360, cusps)
@@ -345,8 +447,14 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
     period = f"{retro_info['start_date']} — {retro_info['end_date']}"
     start_pos = f"{retro_info['start_sign']} {retro_info['start_deg']}°, {start_house} дом"
     end_pos = f"{retro_info['end_sign']} {retro_info['end_deg']}°, {end_house} дом"
-
     chart_text = "\n".join([f"  {k}: {v}" for k, v in chart.items() if not k.startswith("_")])
+
+    merc_query = f"ретроградный меркурий транзит {retro_info['start_sign']} {start_house} дом меркурий"
+    source_context = retrieve(merc_query)
+    sources_block = (
+        f"\n\n═══ АВТОРСКИЕ МАТЕРИАЛЫ — использовать в приоритете ═══\n{source_context}"
+        if source_context else ""
+    )
 
     system = """Ты — астролог Екатерина. Пишешь разбор ТРАНЗИТНОГО ретроградного Меркурия.
 
@@ -360,7 +468,7 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
 • По имени, по-русски
 • Период + по каким домам проходит + что это значит в жизни
 • Практические советы на этот период (что делать / чего избегать)
-• 3-4 абзаца"""
+• 3-4 абзаца""" + sources_block
 
     user = f"""Имя: {name}
 Натальная карта:
@@ -381,8 +489,25 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
 # ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    saved = get_user(user_id)
 
+    # Обработка возврата после оплаты: /start paid_mercury_year_12345
+    args = context.args
+    if args and args[0].startswith("paid_"):
+        parts = args[0].split("_", 2)
+        if len(parts) == 3:
+            plan_key = parts[1] + "_" + parts[2].split("_")[0]
+            # Проверяем последний платёж пользователя
+            saved = get_user(user_id) or {}
+            payment_id = saved.get("pending_payment_id")
+            if payment_id and check_payment(payment_id):
+                grant_subscription(user_id, plan_key)
+                plan = SUBSCRIPTION_PLANS.get(plan_key, {})
+                await update.message.reply_text(
+                    f"✅ Оплата прошла успешно!\n\n*{plan.get('name', '')}* активирована. Наслаждайся!",
+                    parse_mode="Markdown"
+                )
+
+    saved = get_user(user_id)
     if saved:
         context.user_data.update(saved)
         keyboard = [
@@ -402,12 +527,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return NAME
 
-async def show_main_menu(message, name, edit=False):
+async def show_main_menu(message, context, name=None, edit=False):
+    if name is None:
+        name = context.user_data.get("name", "")
+    has_retro = context.user_data.get("has_retro_personal")
+
     keyboard = [
-        [InlineKeyboardButton("🌙 Прогноз по лунациям", callback_data="menu_lunation")],
+        [InlineKeyboardButton("🌙 Фазы луны", callback_data="menu_lunation")],
         [InlineKeyboardButton("☿ Ретроградный Меркурий", callback_data="menu_mercury")],
-        [InlineKeyboardButton("👥 Вступить в комьюнити", callback_data="menu_community")],
     ]
+    if has_retro:
+        keyboard.append([InlineKeyboardButton("⚡️ Забери свой бонус", callback_data="menu_bonus")])
+    keyboard.append([InlineKeyboardButton("🛒 Подписки и покупки", callback_data="menu_buy")])
+    keyboard.append([InlineKeyboardButton("👥 Сообщество", callback_data="menu_community")])
+
     text = f"Привет, {name}! Что хочешь узнать? 🔮"
     if edit:
         await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -419,24 +552,241 @@ async def handle_saved_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     if query.data == "use_saved":
         name = context.user_data.get("name", "")
-        await show_main_menu(query.message, name, edit=True)
+        await show_main_menu(query.message, context, name=name, edit=True)
         return MAIN_MENU
     elif query.data == "new_data":
         await query.edit_message_text("Хорошо, введём заново. Как тебя зовут?")
         return NAME
 
+def _cache_retro_flag(user_id, context, retrograde):
+    personal = [r for r in retrograde if r[0] in ("Меркурий", "Венера", "Марс")]
+    has_retro = bool(personal)
+    if context.user_data.get("has_retro_personal") != has_retro:
+        context.user_data["has_retro_personal"] = has_retro
+        saved = get_user(user_id) or {}
+        saved["has_retro_personal"] = has_retro
+        save_user(user_id, saved)
+
+async def show_buy_menu(message, context, edit=False):
+    user_id = context.user_data.get("tg_id")
+    keyboard = []
+    for plan_key, plan in SUBSCRIPTION_PLANS.items():
+        if user_id and has_subscription(user_id, plan_key):
+            label = f"✅ {plan['name']} — активна"
+            keyboard.append([InlineKeyboardButton(label, callback_data="noop")])
+        else:
+            keyboard.append([InlineKeyboardButton(
+                f"{plan['name']} — {plan['label']}",
+                callback_data=f"buy_plan_{plan_key}"
+            )])
+    keyboard.append([InlineKeyboardButton("← Назад", callback_data="back_to_menu")])
+
+    text = (
+        "🛒 *Подписки и покупки*\n\n"
+        "Бесплатно доступно:\n"
+        "• 🌙 Фазы луны — новолуния и полнолуния\n"
+        "• ☿ Ретроградный Меркурий\n"
+        "• ⚡️ Бонус по ретроградным планетам\n\n"
+        "Расширенные возможности:"
+    )
+    if edit:
+        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return MAIN_MENU
+
+async def handle_bonus_retro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    name = context.user_data.get("name", "")
+    birth_date = context.user_data.get("birth_date", "")
+    birth_time = context.user_data.get("birth_time", "")
+    birth_city = context.user_data.get("birth_city", "")
+
+    await query.edit_message_text("⚡️ Считаю ретроградные планеты в твоей карте...")
+
+    chart = calculate_natal_chart(birth_date, birth_time, birth_city)
+    if "error" in chart:
+        keyboard = [[InlineKeyboardButton("← Назад", callback_data="back_to_menu")]]
+        await query.message.reply_text(f"Ошибка расчёта: {chart['error']}", reply_markup=InlineKeyboardMarkup(keyboard))
+        return MAIN_MENU
+
+    retrograde = chart.get("_retrograde", [])
+    personal = [r for r in retrograde if r[0] in ("Меркурий", "Венера", "Марс")]
+    _cache_retro_flag(update.effective_user.id, context, retrograde)
+
+    if not personal:
+        keyboard = [[InlineKeyboardButton("← Назад", callback_data="back_to_menu")]]
+        await query.message.reply_text(
+            "У тебя нет ретроградных личных планет (Меркурий, Венера, Марс) в натальной карте.\n\nЭто тоже ценно — твои личные планеты действуют напрямую, без задержки и пересмотра.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return MAIN_MENU
+
+    retro_block = await get_retrograde_block(name, retrograde)
+    if retro_block:
+        await query.message.reply_text(
+            "⚡️ <b>Твоя скрытая сила — ретроградные планеты</b>\n\n" + retro_block,
+            parse_mode="HTML"
+        )
+
+    keyboard = [[InlineKeyboardButton("← Главное меню", callback_data="back_to_menu")]]
+    await query.message.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return MAIN_MENU
+
+async def show_lunation_choice(message, context, edit=False, page=0):
+    all_lun = find_lunations_year()
+    total = len(all_lun)
+    total_pages = max(1, (total + LUNATIONS_PER_PAGE - 1) // LUNATIONS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * LUNATIONS_PER_PAGE
+    end_idx = min(start_idx + LUNATIONS_PER_PAGE, total)
+
+    keyboard = []
+    for i in range(start_idx, end_idx):
+        ltype, date, sign, deg, jd = all_lun[i]
+        emoji = "🌑" if ltype == "НЛ" else "🌕"
+        sign_e = SIGNS_EMOJI.get(sign, "")
+        label = f"{emoji} {date} {sign_e}{sign} {deg}°"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"lun_{i}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("← Назад", callback_data=f"lun_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Вперёд →", callback_data=f"lun_page_{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("← Меню", callback_data="back_to_menu")])
+
+    text = f"🔮 Выбери фазу луны для разбора:\n_страница {page + 1} из {total_pages}_"
+    if edit:
+        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return MAIN_MENU
+
+async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    idx = int(query.data.split("_")[1])
+    all_lun = find_lunations_year()
+
+    if idx >= len(all_lun):
+        await query.edit_message_text("Что-то пошло не так. /start")
+        return ConversationHandler.END
+
+    ltype, date, sign, deg, jd = all_lun[idx]
+    type_name = "🌑 Новолуние" if ltype == "НЛ" else "🌕 Полнолуние"
+    name = context.user_data.get("name", "")
+
+    await query.edit_message_text(
+        f"Выбрано: {type_name} {date} — {sign} {deg}°\n\n✨ Считаю карту и готовлю разбор...\n🔮 Это займёт около минуты"
+    )
+
+    chart = calculate_natal_chart(
+        context.user_data.get("birth_date", ""),
+        context.user_data.get("birth_time", ""),
+        context.user_data.get("birth_city", "")
+    )
+    if "error" in chart:
+        await query.message.reply_text(f"Ошибка расчёта: {chart['error']}\n/start")
+        return ConversationHandler.END
+
+    retrograde = chart.get("_retrograde", [])
+    personal_retro = [r for r in retrograde if r[0] in ("Меркурий", "Венера", "Марс")]
+    _cache_retro_flag(update.effective_user.id, context, retrograde)
+
+    forecast = await get_astro_forecast(name, chart, jd, ltype)
+    await query.message.reply_text(forecast)
+
+    keyboard = [
+        [InlineKeyboardButton("🔮 Другая фаза луны", callback_data="another_lunation")],
+    ]
+    if personal_retro:
+        keyboard.append([InlineKeyboardButton("⚡️ Забери свой бонус", callback_data="menu_bonus")])
+    keyboard.append([InlineKeyboardButton("← Главное меню", callback_data="back_to_menu")])
+
+    await query.message.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return MAIN_MENU
+
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
-    if query.data == "menu_community":
-        keyboard = [[InlineKeyboardButton("👥 Перейти в комьюнити", url=COMMUNITY_LINK)],
-                    [InlineKeyboardButton("← Назад", callback_data="back_to_menu")]]
+    if query.data == "noop":
+        return MAIN_MENU
+
+    elif query.data == "menu_community":
+        keyboard = [
+            [InlineKeyboardButton("👥 Перейти в сообщество", url=COMMUNITY_LINK)],
+            [InlineKeyboardButton("← Назад", callback_data="back_to_menu")]
+        ]
         await query.edit_message_text(
-            "👥 *Комьюнити Astro Bushido*\n\nСкоро здесь будет ссылка на наше сообщество — место где мы разбираем лунные циклы, говорим про трансформацию и поддерживаем друг друга. 🌙",
+            "👥 *Сообщество Astro Bushido*\n\nЗдесь мы разбираем лунные циклы, говорим о трансформации и поддерживаем друг друга 🌙\n\nПрисоединяйся!",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
+        return MAIN_MENU
+
+    elif query.data == "menu_buy":
+        return await show_buy_menu(query.message, context, edit=True)
+
+    elif query.data.startswith("buy_plan_"):
+        plan_key = query.data.replace("buy_plan_", "")
+        plan = SUBSCRIPTION_PLANS.get(plan_key)
+        if not plan:
+            return MAIN_MENU
+
+        user_id = update.effective_user.id
+        await query.edit_message_text(f"⏳ Создаю ссылку на оплату...")
+
+        result = create_payment(user_id, plan_key)
+        if not result:
+            await query.message.reply_text("Ошибка создания платежа. Попробуй позже.")
+            return MAIN_MENU
+
+        # Сохраняем payment_id для проверки после возврата
+        saved = get_user(user_id) or {}
+        saved["pending_payment_id"] = result["payment_id"]
+        save_user(user_id, saved)
+
+        keyboard = [
+            [InlineKeyboardButton(f"💳 Оплатить {plan['label']}", url=result["url"])],
+            [InlineKeyboardButton("✅ Я оплатила", callback_data=f"check_payment_{result['payment_id']}_{plan_key}")],
+            [InlineKeyboardButton("← Назад", callback_data="menu_buy")],
+        ]
+        await query.message.reply_text(
+            f"*{plan['name']}*\n\n{plan['desc']}\n\nСтоимость: *{plan['label']}*\n\n"
+            f"Нажми кнопку ниже для оплаты. После оплаты нажми *«Я оплатила»*.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return MAIN_MENU
+
+    elif query.data.startswith("check_payment_"):
+        parts = query.data.split("_", 3)
+        payment_id = parts[2]
+        plan_key = parts[3]
+        user_id = update.effective_user.id
+
+        if check_payment(payment_id):
+            grant_subscription(user_id, plan_key)
+            plan = SUBSCRIPTION_PLANS.get(plan_key, {})
+            keyboard = [[InlineKeyboardButton("← Главное меню", callback_data="back_to_menu")]]
+            await query.edit_message_text(
+                f"✅ *Оплата подтверждена!*\n\n*{plan.get('name', '')}* активирована.\nСпасибо! 🌙",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+        else:
+            keyboard = [
+                [InlineKeyboardButton("🔄 Проверить ещё раз", callback_data=query.data)],
+                [InlineKeyboardButton("← Назад", callback_data="menu_buy")],
+            ]
+            await query.edit_message_text(
+                "⏳ Платёж пока не найден. Если ты уже оплатила — подожди минуту и проверь ещё раз.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         return MAIN_MENU
 
     elif query.data == "menu_mercury":
@@ -467,122 +817,75 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.message.reply_text(f"Ошибка расчёта карты: {chart['error']}")
             return MAIN_MENU
 
+        retrograde = chart.get("_retrograde", [])
+        _cache_retro_flag(update.effective_user.id, context, retrograde)
+
         forecast = await get_mercury_retro_forecast(name, chart, retro_info)
         await query.message.reply_text(forecast)
 
-        # Если у человека натальный Меркурий ретро — особое поздравление
-        retro = chart.get("_retrograde", [])
-        has_natal_merc_retro = any(r[0] == "Меркурий" for r in retro)
+        has_natal_merc_retro = any(r[0] == "Меркурий" for r in retrograde)
         if has_natal_merc_retro:
             await query.message.reply_text(
                 "⚡️ *Особый момент:* у тебя натальный Меркурий ℞ — ты прирождённый навигатор в этом периоде. Пока другие спотыкаются, ты работаешь в родной стихии. Это твоё время.",
                 parse_mode="Markdown"
             )
 
-        keyboard = [
-            [InlineKeyboardButton("← Вернуться в меню", callback_data="back_to_menu")]
-        ]
+        keyboard = [[InlineKeyboardButton("← Вернуться в меню", callback_data="back_to_menu")]]
         await query.message.reply_text("Что-то ещё?", reply_markup=InlineKeyboardMarkup(keyboard))
         return MAIN_MENU
 
     elif query.data == "menu_lunation":
         return await show_lunation_choice(query.message, context, edit=True)
 
+    elif query.data == "menu_bonus":
+        return await handle_bonus_retro(update, context)
+
     elif query.data == "back_to_menu":
         name = context.user_data.get("name", "")
-        await show_main_menu(query.message, name, edit=True)
+        await show_main_menu(query.message, context, name=name, edit=True)
         return MAIN_MENU
 
     elif query.data == "another_lunation":
         return await show_lunation_choice(query.message, context, edit=True)
 
-    elif query.data.startswith("НЛ_") or query.data.startswith("ПЛ_"):
+    elif query.data.startswith("lun_page_"):
+        page = int(query.data.split("_")[2])
+        return await show_lunation_choice(query.message, context, edit=True, page=page)
+
+    elif query.data.startswith("lun_"):
         return await handle_lunation_choice(update, context)
 
     return MAIN_MENU
 
-async def show_lunation_choice(message, context, edit=False):
-    lunations = find_lunations_around_now(weeks_back=3)
-    context.user_data["lunations"] = {}
-    for i, (date, sign, deg, jd) in enumerate(lunations["НЛ"]):
-        context.user_data["lunations"][f"НЛ_{i}"] = (date, sign, deg, jd)
-    for i, (date, sign, deg, jd) in enumerate(lunations["ПЛ"]):
-        context.user_data["lunations"][f"ПЛ_{i}"] = (date, sign, deg, jd)
-
-    keyboard = []
-    for i, (date, sign, deg, jd) in enumerate(lunations["НЛ"]):
-        e = SIGNS_EMOJI.get(sign, "")
-        keyboard.append([InlineKeyboardButton(f"🌑 Новолуние {date} {e}{sign} {deg}°", callback_data=f"НЛ_{i}")])
-    for i, (date, sign, deg, jd) in enumerate(lunations["ПЛ"]):
-        e = SIGNS_EMOJI.get(sign, "")
-        keyboard.append([InlineKeyboardButton(f"🌕 Полнолуние {date} {e}{sign} {deg}°", callback_data=f"ПЛ_{i}")])
-    keyboard.append([InlineKeyboardButton("← Назад", callback_data="back_to_menu")])
-
-    text = "🔮 Выбери лунацию для персонального разбора:"
-    if edit:
-        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return MAIN_MENU
-
-async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    lunation_key = query.data
-    lunations = context.user_data.get("lunations", {})
-    lunation = lunations.get(lunation_key)
-    if not lunation:
-        await query.edit_message_text("Что-то пошло не так. /start")
-        return ConversationHandler.END
-
-    date, sign, deg, jd = lunation
-    lunation_type = lunation_key.split("_")[0]
-    type_name = "🌑 Новолуние" if lunation_type == "НЛ" else "🌕 Полнолуние"
-    name = context.user_data.get("name", "")
-
-    await query.edit_message_text(
-        f"Выбрано: {type_name} {date} — {sign} {deg}°\n\n✨ Считаю карту и готовлю разбор...\n🔮 Это займёт около минуты"
-    )
-
-    chart = calculate_natal_chart(
-        context.user_data.get("birth_date", ""),
-        context.user_data.get("birth_time", ""),
-        context.user_data.get("birth_city", "")
-    )
-    if "error" in chart:
-        await query.message.reply_text(f"Ошибка расчёта: {chart['error']}\n/start")
-        return ConversationHandler.END
-
-    retrograde = chart.get("_retrograde", [])
-    forecast = await get_astro_forecast(name, chart, jd, lunation_type)
-    await query.message.reply_text(forecast)
-
-    retro_block = await get_retrograde_block(name, retrograde)
-    if retro_block:
-        await query.message.reply_text("⚡️ <b>Твоя скрытая особенность — ретроградные планеты</b>\n\n" + retro_block, parse_mode="HTML")
-
-    keyboard = [
-        [InlineKeyboardButton("🔮 Другая лунация", callback_data="another_lunation")],
-        [InlineKeyboardButton("← Главное меню", callback_data="back_to_menu")]
-    ]
-    await query.message.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
-    return MAIN_MENU
-
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["name"] = update.message.text.strip()
-    keyboard = [["✅ Да, согласна"], ["❌ Нет"]]
     await update.message.reply_text(
-        f"Приятно познакомиться, {context.user_data['name']}! 🌟\n\nДля натальной карты мне нужны данные рождения.\nТы согласна на обработку персональных данных?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        f"Приятно познакомиться, {context.user_data['name']}! 🌟\n\n"
+        f"Для натальной карты мне нужны данные рождения.\n\n"
+        f"Нажимая кнопку *«Соглашаюсь»*, ты даёшь согласие на обработку персональных данных "
+        f"в соответствии с [политикой обработки персональных данных]({PRIVACY_POLICY_URL}), "
+        f"а также даёшь согласие на получение рекламной и информационной рассылки.\n\n"
+        f"Нажми *«Соглашаюсь»*, чтобы продолжить.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Соглашаюсь", callback_data="consent_yes")],
+            [InlineKeyboardButton("❌ Не соглашаюсь", callback_data="consent_no")],
+        ]),
+        parse_mode="Markdown",
+        disable_web_page_preview=True
     )
     return CONSENT
 
 async def get_consent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if "Да" in update.message.text:
-        await update.message.reply_text("Отлично! 🙏\n\nВведи дату рождения в формате ДД.ММ.ГГГГ\nНапример: 31.03.1997", reply_markup=ReplyKeyboardRemove())
+    query = update.callback_query
+    await query.answer()
+    if query.data == "consent_yes":
+        context.user_data["consent_at"] = datetime.now(timezone.utc).isoformat()
+        await query.edit_message_text(
+            "Отлично! 🙏\n\nВведи дату рождения в формате ДД.ММ.ГГГГ\nНапример: 31.03.1997"
+        )
         return BIRTH_DATE
     else:
-        await update.message.reply_text("Хорошо. Если передумаешь — /start", reply_markup=ReplyKeyboardRemove())
+        await query.edit_message_text("Хорошо. Если передумаешь — /start")
         return ConversationHandler.END
 
 async def get_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -611,14 +914,17 @@ async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     city = update.message.text.strip()
     context.user_data["birth_city"] = city
     user_id = update.effective_user.id
+    context.user_data["tg_id"] = user_id
     save_user(user_id, {
         "name": context.user_data["name"],
         "birth_date": context.user_data["birth_date"],
         "birth_time": context.user_data["birth_time"],
-        "birth_city": city
+        "birth_city": city,
+        "consent_at": context.user_data.get("consent_at", ""),
+        "tg_id": user_id,
     })
     await update.message.reply_text("✨ Данные сохранены — больше не придётся вводить заново.")
-    await show_main_menu(update.message, context.user_data["name"])
+    await show_main_menu(update.message, context, context.user_data["name"])
     return MAIN_MENU
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -635,7 +941,7 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            CONSENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_consent)],
+            CONSENT: [CallbackQueryHandler(get_consent, pattern="^consent_")],
             BIRTH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_birth_date)],
             BIRTH_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_birth_time)],
             BIRTH_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_birth_city)],
@@ -647,7 +953,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv_handler)
-    print("🌙 Astro Bushido Bot v3 — меню + лунации + Меркурий ℞ + сохранение данных")
+    print("🌙 Astro Bushido Bot — фазы луны + Меркурий ℞ + бонус + ЮКасса")
     app.run_polling()
 
 if __name__ == "__main__":
