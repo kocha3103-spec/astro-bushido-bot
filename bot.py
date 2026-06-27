@@ -983,6 +983,19 @@ async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await show_main_menu(update.message, context, context.user_data["name"])
     return MAIN_MENU
 
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Сброс данных текущего пользователя — можно начать заново."""
+    user_id = update.effective_user.id
+    data = load_user_data()
+    if str(user_id) in data:
+        del data[str(user_id)]
+        save_user_data(data)
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🧹 твои данные удалены. можно начать заново — нажми /start 🌙"
+    )
+    return ConversationHandler.END
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("отменено. /start чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
@@ -1041,6 +1054,7 @@ def main():
     )
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("reset", reset))
 
     # фоновые задачи работают только если установлен job-queue
     if app.job_queue is not None:
