@@ -22,7 +22,7 @@ YOOKASSA_SHOP_ID = os.environ.get("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET = os.environ.get("YOOKASSA_SECRET", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 HYDRA_API_URL = "https://api.hydraai.ru/v1/chat/completions"
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-opus-4.6"
 USER_DATA_FILE = os.environ.get("USER_DATA_FILE", "/data/user_data.json")
 COMMUNITY_LINK = "https://t.me/astro_bushido"
 KATYA_TG = "katerinakocha"
@@ -63,12 +63,13 @@ logger = logging.getLogger(__name__)
 
 SIGNS = ["Овен","Телец","Близнецы","Рак","Лев","Дева","Весы","Скорпион","Стрелец","Козерог","Водолей","Рыбы"]
 SIGNS_EMOJI = {"Овен":"♈","Телец":"♉","Близнецы":"♊","Рак":"♋","Лев":"♌","Дева":"♍",
-"Весы":"♎","Скорпион":"♏","Стрелец":"♐","Козерог":"♑","Водолей":"♒","Рыбы":"♓"}
+               "Весы":"♎","Скорпион":"♏","Стрелец":"♐","Козерог":"♑","Водолей":"♒","Рыбы":"♓"}
 
 _LUNATIONS_CACHE = None
 _LUNATIONS_CACHE_DATE = None
 
-# ── ХРАНЕНИЕ ДАННЫХ ────────────────────────────────
+
+# ── ХРАНЕНИЕ ДАННЫХ ──────────────────────────────────────────────
 def _ensure_data_dir():
     d = os.path.dirname(USER_DATA_FILE)
     if d:
@@ -144,7 +145,8 @@ def add_bonus_forecast(referrer_id):
         return True
     return False
 
-# ── ЮКАССА ──────────────────────────────────────
+
+# ── ЮКАССА ───────────────────────────────────────────────────────
 def create_payment(user_id: int, plan_key: str):
     plan = SUBSCRIPTION_PLANS.get(plan_key)
     if not plan:
@@ -173,7 +175,7 @@ def check_payment(payment_id: str) -> bool:
         return False
 
 
-# ── АСТРО-РАСЧЁТЫ ──────────────────────────────────
+# ── АСТРО-РАСЧЁТЫ ─────────────────────────────────────────────────
 def fmt_position(lon):
     lon = lon % 360
     return SIGNS[int(lon / 30)], round(lon % 30, 1)
@@ -347,7 +349,8 @@ def get_moon_event_by_jd(event_jd, cusps):
     y, m, d, h = swe.revjul(event_jd)
     return moon_lon, f"{int(d):02d}.{int(m):02d}.{int(y)}", sign, degree, house
 
-# ── CLAUDE ───────────────────────────────────────
+
+# ── CLAUDE ────────────────────────────────────────────────────────
 async def call_claude(system_prompt, user_prompt, max_tokens=1400):
     try:
         async with httpx.AsyncClient(timeout=90) as client:
@@ -365,33 +368,34 @@ async def call_claude(system_prompt, user_prompt, max_tokens=1400):
     except Exception as e:
         return f"ошибка подключения: {str(e)}"
 
-SYSTEM_ASTRO = """ты — астролог катя. подход глубокий, тёплый, честный. не предсказываешь — помогаешь увидеть и прожить.
+SYSTEM_ASTRO = """ты — астролог катерина. пишешь короткий прогноз на фазу луны.
 
-⛔️ ВАЖНО — НИКОГДА НЕ ВЫДУМЫВАЙ:
-• используй ТОЛЬКО те планеты и дома, которые явно указаны в карте. не добавляй ничего лишнего.
-• если планеты нет в доме фазы — так и скажи.
+⛔️ СТРОГО ЗАПРЕЩЕНО:
+• анализировать всю натальную карту — это не твоя задача здесь.
+• перечислять планеты по домам (4 дом, 10 дом и т.д.) — не надо!
+• выдумывать названия знаков зодиака. используй ТОЛЬКО эти 12 знаков: Овен, Телец, Близнецы, Рак, Лев, Дева, Весы, Скорпион, Стрелец, Козерог, Водолей, Рыбы.
+• обращаться иначе, чем написал пользователь. если написали "Екатерина" — обращайся "Екатерина", не "Катя".
 
-═══ ВЗГЛЯД ═══
-• новолуние — начало цикла, посев. полнолуние — кульминация, что завершается.
-• астрология — язык энергий, не предсказание.
+✅ ТВОЯ ЗАДАЧА:
+• рассказать что означает ЭТА конкретная фаза луны (знак + дом куда она падает).
+• если в доме фазы луны есть натальные планеты — упомяни их коротко (это добавляет глубину).
+• НЕ анализировать остальные дома и планеты карты.
 
 ═══ ТОН ═══
-• по-русски, с маленькой буквы, на ты — как близкая подруга, которая разбирается в астрологии.
-• тепло и честно. без гороскопного позитива и без пустых слов.
-• короткие живые предложения.
+• по-русски, с маленькой буквы, на ты.
+• тепло и конкретно. короткие живые предложения.
+• как подруга-астролог, не академический разбор.
 
 ═══ ФОРМАТ (строго) ═══
-• по имени, на ты.
-• максимум 3 коротких абзаца на разбор.
-• только реальные планеты из карты.
+• начинай с: "твой прогноз по [новолунию/полнолунию] в [знак] на [период]"
+• 2-3 коротких абзаца про эту фазу луны.
 • в конце — 3 вопроса для рефлексии:
-  1. вопрос по теме прогноза (что происходит в этой сфере?)
-  2. вопрос про жизнь прямо сейчас (как это проявляется у тебя?)
-  3. ОБЯЗАТЕЛЬНО вопрос про телесные ощущения — как ты чувствуешь это в теле? где замечаешь напряжение или лёгкость?
-• весь ответ — не длиннее 4 абзацев + вопросы."""
+  1. вопрос про эту сферу жизни (дом фазы)
+  2. как это проявляется у тебя прямо сейчас?
+  3. ОБЯЗАТЕЛЬНО про телесные ощущения — где в теле чувствуешь это напряжение или лёгкость?
+• весь ответ — максимум 3 абзаца + 3 вопроса. не больше."""
 
 async def get_astro_forecast(name, chart, lunation_jd, lunation_type):
-    chart = dict(chart)
     cusps = chart.pop("_cusps", None)
     retrograde = chart.pop("_retrograde", None) or []
     chart.pop("_lat", None); chart.pop("_lon", None)
@@ -438,11 +442,22 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
     merc_query = f"ретроградный меркурий транзит {retro_info['start_sign']} {start_house} дом"
     source_context = retrieve(merc_query)
     sources_block = f"\n\n═══ АВТОРСКИЕ МАТЕРИАЛЫ (приоритет) ═══\n{source_context}" if source_context else ""
-    system = """ты — астролог катя. пишешь разбор транзитного ретроградного меркурия.
-• не катастрофа, а пауза для переосмысления. смотришь через какой дом он проходит.
-• если натальный меркурий тоже ретро — человек проживает этот период легче (скажи об этом).
-• тон: конкретный, тёплый, на ты, с маленькой буквы.
-• формат: 3 коротких абзаца + 3 вопроса для рефлексии (последний про телесные ощущения).""" + sources_block
+    system = """ты — астролог катерина. пишешь прогноз на период ретроградного меркурия.
+
+⛔️ СТРОГО:
+• используй ТОЛЬКО эти 12 знаков: Овен, Телец, Близнецы, Рак, Лев, Дева, Весы, Скорпион, Стрелец, Козерог, Водолей, Рыбы. никаких других названий.
+• не анализируй всю натальную карту. только про меркурий ретро и через какой дом он идёт.
+• обращайся точно тем именем, которое написал пользователь.
+
+✅ ЗАДАЧА:
+• объяснить что значит этот период ретро меркурия именно для этого человека — через какой дом он проходит.
+• практические советы на этот период.
+• если натальный меркурий тоже ретро — человек легче проходит этот период, упомяни.
+
+═══ ФОРМАТ ═══
+• начинай с: "твой прогноз на ретроградный меркурий [период]"
+• 2-3 коротких абзаца. тепло, конкретно, на ты.
+• в конце 3 вопроса для рефлексии, последний — про телесные ощущения.""" + sources_block
     user = f"""имя: {name}
 натальная карта:
 {chart_text}
@@ -453,7 +468,8 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
 конец: {retro_info['end_sign']} {retro_info['end_deg']}°, {end_house} дом"""
     return await call_claude(system, user)
 
-# ── ПЕЙВОЛЛ ────────────────────────────────────────
+
+# ── ПЕЙВОЛЛ ───────────────────────────────────────────────────────
 async def show_paywall(message, user_id, edit=False):
     used = get_free_used(user_id)
     limit = get_free_limit(user_id)
@@ -473,7 +489,8 @@ async def show_paywall(message, user_id, edit=False):
     else:
         await message.reply_text(text, reply_markup=mk, parse_mode="Markdown")
 
-# ── АВТОМАТИЧЕСКОЕ УВЕДОМЛЕНИЕ О НОВОЛУНИИ ───────────
+
+# ── АВТОМАТИЧЕСКОЕ УВЕДОМЛЕНИЕ О НОВОЛУНИИ ───────────────────────
 async def send_newmoon_notifications(context: ContextTypes.DEFAULT_TYPE):
     """Запускается ежедневно. Если через 3 дня новолуние — шлёт уведомление всем пользователям."""
     now = datetime.now(timezone.utc)
@@ -513,7 +530,8 @@ async def send_newmoon_notifications(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"не удалось отправить уведомление {uid_str}: {e}")
     save_user_data(data)
 
-# ── НАПОМИНАЛКА ПОСЛЕ ОКОНЧАНИЯ БЕСПЛАТНЫХ ───────────
+
+# ── НАПОМИНАЛКА ПОСЛЕ ОКОНЧАНИЯ БЕСПЛАТНЫХ ───────────────────────
 async def send_retention_messages(context: ContextTypes.DEFAULT_TYPE):
     """Раз в неделю шлёт тёплое сообщение тем, у кого кончились бесплатные прогнозы."""
     data = load_user_data()
@@ -549,7 +567,8 @@ async def send_retention_messages(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"retention {uid_str}: {e}")
     save_user_data(data)
 
-# ── ГЛАВНОЕ МЕНЮ ─────────────────────────────────
+
+# ── ГЛАВНОЕ МЕНЮ ─────────────────────────────────────────────────
 async def show_main_menu(message, context, name=None, edit=False):
     if name is None:
         name = context.user_data.get("name", "")
@@ -571,7 +590,8 @@ async def show_main_menu(message, context, name=None, edit=False):
     else:
         await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ── HANDLERS ──────────────────────────────────────
+
+# ── HANDLERS ─────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     args = context.args or []
@@ -609,11 +629,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     # новый пользователь — 2 отдельных сообщения
     await update.message.reply_text(
-        "привет, мои дорогие! 🌙 на связи катя.\n\n"
+        "привет, дорогие! 🌙 на связи катерина.\n\n"
         "это мой бот, где можно настроиться на лунные и планетарные ритмы, задать себе вопросы и отслеживать как астрология проявляется в твоей жизни каждый месяц ✨\n\n"
-        "я сама много лет наблюдаю за этим — это правда улучшает качество жизни и помогает лучше понимать себя."
+        "сама много лет наблюдаю за этим — это правда улучшает качество жизни и помогает лучше понимать себя."
     )
-    await update.message.reply_text("как тебя зовут?")
+    await update.message.reply_text(
+        "спасибо за твой интерес, как я могу к тебе обращаться?\n\n"
+        f"оставляя имя, вы соглашаетесь на обработку персональных данных, а так же принимаете [политику конфиденциальности]({PRIVACY_POLICY_URL}) и договор публичной оферты."
+    )
     return NAME
 
 async def handle_saved_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -681,7 +704,6 @@ async def show_lunation_choice(message, context, edit=False, page=0):
 
 async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
     user_id = update.effective_user.id
     # callback может быть lun_N или nm_notify_N
     idx = int(query.data.split("_")[-1])
@@ -890,14 +912,15 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     return MAIN_MENU
 
-# ── ОНБОРДИНГ ────────────────────────────────────
+
+# ── ОНБОРДИНГ ────────────────────────────────────────────────────
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     context.user_data["name"] = name
     await update.message.reply_text(
         f"{name}, садись поудобнее 🌙\n\n"
-        "для персональных прогнозов мне нужны данные твоего рождения. "
-        f"оставляя их, ты соглашаешься на [обработку персональных данных]({PRIVACY_POLICY_URL}).",
+        "для персональных прогнозов мне нужны данные твоего рождения.\n\n"
+        "нажимая «соглашаюсь», ты подтверждаешь согласие на обработку данных.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ соглашаюсь", callback_data="consent_yes")],
             [InlineKeyboardButton("❌ не соглашаюсь", callback_data="consent_no")],
@@ -962,7 +985,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("отменено. /start чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-# ── СТАТИСТИКА (только для админа) ───────────────
+
+# ── СТАТИСТИКА (только для админа) ───────────────────────────────
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -993,7 +1017,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-# ── ЗАПУСК ────────────────────────────────────────
+
+# ── ЗАПУСК ───────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -1015,17 +1040,14 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("stats", stats))
 
-    # ежедневные задачи работают только если установлен job-queue
-    if app.job_queue is not None:
-        # ежедневная проверка новолуний (10:00 UTC)
-        app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
-        # напоминалка раз в неделю
-        app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
-    else:
-        logger.warning("job_queue недоступен — установи python-telegram-bot[job-queue]. авто-уведомления отключены.")
+    # ежедневная проверка новолуний (10:00 UTC)
+    app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
+    # напоминалка раз в неделю
+    app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
 
     print("🌙 astro bushido bot запущен")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
