@@ -396,6 +396,7 @@ SYSTEM_ASTRO = """ты — астролог катерина. пишешь ко�
 • весь ответ — максимум 3 абзаца + 3 вопроса. не больше."""
 
 async def get_astro_forecast(name, chart, lunation_jd, lunation_type):
+    chart = dict(chart)
     cusps = chart.pop("_cusps", None)
     retrograde = chart.pop("_retrograde", None) or []
     chart.pop("_lat", None); chart.pop("_lon", None)
@@ -704,6 +705,7 @@ async def show_lunation_choice(message, context, edit=False, page=0):
 
 async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    await query.answer()
     user_id = update.effective_user.id
     # callback может быть lun_N или nm_notify_N
     idx = int(query.data.split("_")[-1])
@@ -1040,10 +1042,14 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("stats", stats))
 
-    # ежедневная проверка новолуний (10:00 UTC)
-    app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
-    # напоминалка раз в неделю
-    app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
+    # фоновые задачи работают только если установлен job-queue
+    if app.job_queue is not None:
+        # ежедневная проверка новолуний (10:00 UTC)
+        app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
+        # напоминалка раз в неделю
+        app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
+    else:
+        logger.warning("job_queue недоступен — установи python-telegram-bot[job-queue]. авто-уведомления отключены.")
 
     print("🌙 astro bushido bot запущен")
     app.run_polling()
