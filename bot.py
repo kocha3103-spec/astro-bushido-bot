@@ -20,9 +20,10 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 HYDRA_API_KEY = os.environ["HYDRA_API_KEY"]
 YOOKASSA_SHOP_ID = os.environ["YOOKASSA_SHOP_ID"]
 YOOKASSA_SECRET = os.environ["YOOKASSA_SECRET"]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))  # Telegram ID администратора для /stats
 HYDRA_API_URL = "https://api.hydraai.ru/v1/chat/completions"
 MODEL = "claude-opus-4.6"
-USER_DATA_FILE = "user_data.json"
+USER_DATA_FILE = os.environ.get("USER_DATA_FILE", "/data/user_data.json")
 COMMUNITY_LINK = "https://t.me/astro_bushido_bot"  # заменить на реальную ссылку
 PRIVACY_POLICY_URL = "https://telegra.ph/privacy-astro-bushido"  # заменить после публикации
 
@@ -100,6 +101,10 @@ def grant_subscription(user_id, plan_key):
     if "subscriptions" not in data[uid]:
         data[uid]["subscriptions"] = {}
     data[uid]["subscriptions"][plan_key] = True
+    # Трекаем время оплаты
+    if "payments" not in data[uid]:
+        data[uid]["payments"] = []
+    data[uid]["payments"].append({"plan": plan_key, "at": datetime.now(timezone.utc).isoformat()})
     save_user_data(data)
 
 
@@ -932,6 +937,42 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+
+# ========================
+# АНАЛИТИКА /stats
+# ========================
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Только для администратора: статистика бота."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ У тебя нет доступа к этой команде.")
+        return
+
+    data = load_user_data()
+    total_users = len(data)
+    paid_users = 0
+    total_payments = 0
+    plan_counts = {}
+    for uid, udata in data.items():
+        subs = udata.get("subscriptions", {})
+        if any(subs.values()):
+            paid_users += 1
+        pmts = udata.get("payments", [])
+        total_payments += len(pmts)
+        for p in pmts:
+            plan = p.get("plan", "unknown")
+            plan_counts[plan] = plan_counts.get(plan, 0) + 1
+
+    plan_lines = "\n".join([f"  • {SUBSCRIPTION_PLANS.get(k, {}).get('name', k)}: {v} шт." for k, v in plan_counts.items()]) or "  нет"
+
+    text = (
+        f"📊 *Статистика Astro Bushido Bot*\n\n"
+        f"👤 Всего пользователей: *{total_users}*\n"
+        f"💳 Оплатили хотя бы раз: *{paid_users}*\n"
+        f"🧾 Всего транзакций: *{total_payments}*\n\n"
+        f"💰 По тарифам:\n{plan_lines}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
 # ========================
 # ЗАПУСК
 # ========================
@@ -953,6 +994,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("stats", stats))
     print("🌙 Astro Bushido Bot — фазы луны + Меркурий ℞ + бонус + ЮКасса")
     app.run_polling()
 
