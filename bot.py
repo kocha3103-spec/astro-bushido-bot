@@ -63,13 +63,12 @@ logger = logging.getLogger(__name__)
 
 SIGNS = ["Овен","Телец","Близнецы","Рак","Лев","Дева","Весы","Скорпион","Стрелец","Козерог","Водолей","Рыбы"]
 SIGNS_EMOJI = {"Овен":"♈","Телец":"♉","Близнецы":"♊","Рак":"♋","Лев":"♌","Дева":"♍",
-               "Весы":"♎","Скорпион":"♏","Стрелец":"♐","Козерог":"♑","Водолей":"♒","Рыбы":"♓"}
+"Весы":"♎","Скорпион":"♏","Стрелец":"♐","Козерог":"♑","Водолей":"♒","Рыбы":"♓"}
 
 _LUNATIONS_CACHE = None
 _LUNATIONS_CACHE_DATE = None
 
-
-# ── ХРАНЕНИЕ ДАННЫХ ──────────────────────────────────────────────
+# ── ХРАНЕНИЕ ДАННЫХ ────────────────────────────────
 def _ensure_data_dir():
     d = os.path.dirname(USER_DATA_FILE)
     if d:
@@ -145,8 +144,7 @@ def add_bonus_forecast(referrer_id):
         return True
     return False
 
-
-# ── ЮКАССА ───────────────────────────────────────────────────────
+# ── ЮКАССА ──────────────────────────────────────
 def create_payment(user_id: int, plan_key: str):
     plan = SUBSCRIPTION_PLANS.get(plan_key)
     if not plan:
@@ -175,7 +173,7 @@ def check_payment(payment_id: str) -> bool:
         return False
 
 
-# ── АСТРО-РАСЧЁТЫ ─────────────────────────────────────────────────
+# ── АСТРО-РАСЧЁТЫ ──────────────────────────────────
 def fmt_position(lon):
     lon = lon % 360
     return SIGNS[int(lon / 30)], round(lon % 30, 1)
@@ -349,8 +347,7 @@ def get_moon_event_by_jd(event_jd, cusps):
     y, m, d, h = swe.revjul(event_jd)
     return moon_lon, f"{int(d):02d}.{int(m):02d}.{int(y)}", sign, degree, house
 
-
-# ── CLAUDE ────────────────────────────────────────────────────────
+# ── CLAUDE ───────────────────────────────────────
 async def call_claude(system_prompt, user_prompt, max_tokens=1400):
     try:
         async with httpx.AsyncClient(timeout=90) as client:
@@ -394,6 +391,7 @@ SYSTEM_ASTRO = """ты — астролог катя. подход глубок�
 • весь ответ — не длиннее 4 абзацев + вопросы."""
 
 async def get_astro_forecast(name, chart, lunation_jd, lunation_type):
+    chart = dict(chart)
     cusps = chart.pop("_cusps", None)
     retrograde = chart.pop("_retrograde", None) or []
     chart.pop("_lat", None); chart.pop("_lon", None)
@@ -455,8 +453,7 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
 конец: {retro_info['end_sign']} {retro_info['end_deg']}°, {end_house} дом"""
     return await call_claude(system, user)
 
-
-# ── ПЕЙВОЛЛ ───────────────────────────────────────────────────────
+# ── ПЕЙВОЛЛ ────────────────────────────────────────
 async def show_paywall(message, user_id, edit=False):
     used = get_free_used(user_id)
     limit = get_free_limit(user_id)
@@ -476,8 +473,7 @@ async def show_paywall(message, user_id, edit=False):
     else:
         await message.reply_text(text, reply_markup=mk, parse_mode="Markdown")
 
-
-# ── АВТОМАТИЧЕСКОЕ УВЕДОМЛЕНИЕ О НОВОЛУНИИ ───────────────────────
+# ── АВТОМАТИЧЕСКОЕ УВЕДОМЛЕНИЕ О НОВОЛУНИИ ───────────
 async def send_newmoon_notifications(context: ContextTypes.DEFAULT_TYPE):
     """Запускается ежедневно. Если через 3 дня новолуние — шлёт уведомление всем пользователям."""
     now = datetime.now(timezone.utc)
@@ -517,8 +513,7 @@ async def send_newmoon_notifications(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"не удалось отправить уведомление {uid_str}: {e}")
     save_user_data(data)
 
-
-# ── НАПОМИНАЛКА ПОСЛЕ ОКОНЧАНИЯ БЕСПЛАТНЫХ ───────────────────────
+# ── НАПОМИНАЛКА ПОСЛЕ ОКОНЧАНИЯ БЕСПЛАТНЫХ ───────────
 async def send_retention_messages(context: ContextTypes.DEFAULT_TYPE):
     """Раз в неделю шлёт тёплое сообщение тем, у кого кончились бесплатные прогнозы."""
     data = load_user_data()
@@ -554,8 +549,7 @@ async def send_retention_messages(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"retention {uid_str}: {e}")
     save_user_data(data)
 
-
-# ── ГЛАВНОЕ МЕНЮ ─────────────────────────────────────────────────
+# ── ГЛАВНОЕ МЕНЮ ─────────────────────────────────
 async def show_main_menu(message, context, name=None, edit=False):
     if name is None:
         name = context.user_data.get("name", "")
@@ -577,8 +571,7 @@ async def show_main_menu(message, context, name=None, edit=False):
     else:
         await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-
-# ── HANDLERS ─────────────────────────────────────────────────────
+# ── HANDLERS ──────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     args = context.args or []
@@ -688,6 +681,7 @@ async def show_lunation_choice(message, context, edit=False, page=0):
 
 async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    await query.answer()
     user_id = update.effective_user.id
     # callback может быть lun_N или nm_notify_N
     idx = int(query.data.split("_")[-1])
@@ -896,8 +890,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     return MAIN_MENU
 
-
-# ── ОНБОРДИНГ ────────────────────────────────────────────────────
+# ── ОНБОРДИНГ ────────────────────────────────────
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     context.user_data["name"] = name
@@ -969,8 +962,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("отменено. /start чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-
-# ── СТАТИСТИКА (только для админа) ───────────────────────────────
+# ── СТАТИСТИКА (только для админа) ───────────────
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -1001,8 +993,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
-# ── ЗАПУСК ───────────────────────────────────────────────────────
+# ── ЗАПУСК ────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -1024,10 +1015,14 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("stats", stats))
 
-    # ежедневная проверка новолуний (10:00 UTC)
-    app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
-    # напоминалка раз в неделю
-    app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
+    # ежедневные задачи работают только если установлен job-queue
+    if app.job_queue is not None:
+        # ежедневная проверка новолуний (10:00 UTC)
+        app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
+        # напоминалка раз в неделю
+        app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
+    else:
+        logger.warning("job_queue недоступен — установи python-telegram-bot[job-queue]. авто-уведомления отключены.")
 
     print("🌙 astro bushido bot запущен")
     app.run_polling()
