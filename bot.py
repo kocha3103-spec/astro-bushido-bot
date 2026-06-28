@@ -38,8 +38,8 @@ SUBSCRIPTION_PLANS = {
     "full_year": {
         "name": "✨ безлимит на весь год",
         "desc": "все виды прогнозов без ограничений на 1 год — включая новые, которые буду добавлять в течение года.",
-        "price": "7000.00",
-        "label": "7 000 ₽",
+        "price": "5000.00",
+        "label": "5 000 ₽",
     },
     "month": {
         "name": "🌙 безлимит на месяц",
@@ -50,8 +50,8 @@ SUBSCRIPTION_PLANS = {
     "single": {
         "name": "🔮 один прогноз",
         "desc": "один персональный прогноз на выбор.",
-        "price": "150.00",
-        "label": "150 ₽",
+        "price": "100.00",
+        "label": "100 ₽",
     },
 }
 
@@ -107,12 +107,42 @@ def grant_subscription(user_id, plan_key):
     uid = str(user_id)
     if uid not in data:
         data[uid] = {}
-    data[uid].setdefault("subscriptions", {})[plan_key] = True
+    now = datetime.now(timezone.utc)
+    subs = data[uid].setdefault("subscriptions", {})
+
+    if plan_key == "full_year":
+        subs["full_year"] = (now + timedelta(days=365)).isoformat()
+    elif plan_key == "month":
+        subs["month"] = (now + timedelta(days=30)).isoformat()
+    elif plan_key == "single":
+        data[uid]["bonus_forecasts"] = data[uid].get("bonus_forecasts", 0) + 1
+
     data[uid].setdefault("payments", []).append({
         "plan": plan_key,
-        "at": datetime.now(timezone.utc).isoformat()
+        "at": now.isoformat()
     })
     save_user_data(data)
+
+def has_active_unlimited(user_id):
+    """Безлимит активен, если есть непросроченная подписка month или full_year."""
+    user = get_user(user_id)
+    if not user:
+        return False
+    subs = user.get("subscriptions", {})
+    now = datetime.now(timezone.utc)
+    for key in ("full_year", "month"):
+        val = subs.get(key)
+        if not val:
+            continue
+        # старый формат — было True (бессрочно), новый — дата окончания
+        if val is True:
+            return True
+        try:
+            if datetime.fromisoformat(val) > now:
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
 
 def get_free_limit(user_id):
     user = get_user(user_id)
@@ -124,7 +154,7 @@ def get_free_used(user_id):
     return user.get("free_forecasts_used", 0) if user else 0
 
 def can_get_free_forecast(user_id):
-    if has_subscription(user_id, "full_year"):
+    if has_active_unlimited(user_id):
         return True
     return get_free_used(user_id) < get_free_limit(user_id)
 
@@ -349,6 +379,15 @@ def get_moon_event_by_jd(event_jd, cusps):
     y, m, d, h = swe.revjul(event_jd)
     return moon_lon, f"{int(d):02d}.{int(m):02d}.{int(y)}", sign, degree, house
 
+def get_sun_transit(cusps):
+    """Где сейчас транзитное солнце: знак, градус, дом натальной карты."""
+    now = datetime.now(timezone.utc)
+    jd = swe.julday(now.year, now.month, now.day, now.hour + now.minute / 60)
+    sun_lon = swe.calc_ut(jd, swe.SUN)[0][0] % 360
+    sign, degree = fmt_position(sun_lon)
+    house = get_house(sun_lon, cusps)
+    return sun_lon, sign, degree, house
+
 
 # ── CLAUDE ────────────────────────────────────────────────────────
 async def call_claude(system_prompt, user_prompt, max_tokens=1400):
@@ -468,6 +507,46 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
 конец: {retro_info['end_sign']} {retro_info['end_deg']}°, {end_house} дом"""
     return await call_claude(system, user)
 
+async def get_sun_transit_forecast(name, chart):
+    cusps = chart.get("_cusps")
+    if not cusps:
+        return "не удалось рассчитать дома."
+    sun_lon, sign, deg, house = get_sun_transit(cusps)
+    # планеты в этом же доме (из натальной карты)
+    planets_here = []
+    for k, v in chart.items():
+        if k.startswith("_") or k in ("Асцендент", "MC"):
+            continue
+        if f"{house} дом" in v:
+            planets_here.append(k)
+    planets_text = (
+        f"в этом доме есть натальные планеты: {', '.join(planets_here)}"
+        if planets_here else "натальных планет в этом доме нет"
+    )
+    source_context = retrieve(f"солнце {house} дом транзит солнца тема дома")
+    sources_block = f"\n\n═══ АВТОРСКИЕ МАТЕРИАЛЫ (приоритет) ═══\n{source_context}" if source_context else ""
+    system = """ты — астролог катерина. пишешь короткий прогноз про движение солнца сейчас (транзит солнца по дому).
+
+⛔️ СТРОГО:
+• используй ТОЛЬКО эти 12 знаков: Овен, Телец, Близнецы, Рак, Лев, Дева, Весы, Скорпион, Стрелец, Козерог, Водолей, Рыбы.
+• не анализируй всю карту. только про солнце и дом, в котором оно сейчас.
+• обращайся точно тем именем, которое написал пользователь.
+
+✅ ЗАДАЧА:
+• солнце сейчас проходит через определённый дом — расскажи какие темы этого дома поднимаются и подсвечиваются.
+• если в этом доме есть натальные планеты — упомяни коротко (это усиливает темы). если нет — так и скажи.
+
+═══ ФОРМАТ ═══
+• начинай с: "[имя], сейчас твоё солнце в [N] доме"
+• 2-3 коротких абзаца. тепло, на ты, с маленькой буквы.
+• в конце 3 вопроса: про эту сферу, есть ли сдвиг в этой теме, и про телесные ощущения.""" + sources_block
+    user = f"""имя: {name}
+транзитное солнце сейчас: {sign} {deg}°, {house} дом натальной карты
+{planets_text}
+
+составь короткий прогноз про темы этого дома."""
+    return await call_claude(system, user)
+
 
 # ── ПЕЙВОЛЛ ───────────────────────────────────────────────────────
 async def show_paywall(message, user_id, edit=False):
@@ -531,6 +610,57 @@ async def send_newmoon_notifications(context: ContextTypes.DEFAULT_TYPE):
     save_user_data(data)
 
 
+# ── УВЕДОМЛЕНИЕ О ПЕРЕХОДЕ СОЛНЦА В НОВЫЙ ДОМ ────────────────────
+async def send_sun_house_notifications(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневно. Если у пользователя транзитное солнце перешло в новый дом — шлёт уведомление."""
+    data = load_user_data()
+    changed = False
+    for uid_str, udata in data.items():
+        if not udata.get("birth_date"):
+            continue
+        chart = calculate_natal_chart(
+            udata.get("birth_date", ""), udata.get("birth_time", ""), udata.get("birth_city", "")
+        )
+        if "error" in chart:
+            continue
+        cusps = chart.get("_cusps")
+        if not cusps:
+            continue
+        _, sign, deg, house = get_sun_transit(cusps)
+        prev_house = udata.get("last_sun_house")
+        if prev_house == house:
+            continue
+        # первый расчёт — просто запоминаем, не спамим
+        data[uid_str]["last_sun_house"] = house
+        changed = True
+        if prev_house is None:
+            continue
+        name = udata.get("name", "")
+        planets_here = [
+            k for k, v in chart.items()
+            if not k.startswith("_") and k not in ("Асцендент", "MC") and f"{house} дом" in v
+        ]
+        planets_line = (
+            f"и тут у тебя есть планеты: {', '.join(planets_here)} — темы будут ярче"
+            if planets_here else "натальных планет в этом доме нет — но темы всё равно подсветятся"
+        )
+        text = (
+            f"☀️ {name}, твоё солнце перешло в {house} дом!\n\n"
+            f"возможно, поднимутся темы этого дома. {planets_line}.\n\n"
+            f"чувствуешь ли ты сдвиг в эту сторону? как откликается тело?\n\n"
+            f"нажми, чтобы получить полный разбор 👇"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("☀️ мой прогноз по солнцу", callback_data="menu_sun")
+        ]])
+        try:
+            await context.bot.send_message(int(uid_str), text, reply_markup=keyboard)
+        except Exception as e:
+            logger.warning(f"sun-notify {uid_str}: {e}")
+    if changed:
+        save_user_data(data)
+
+
 # ── НАПОМИНАЛКА ПОСЛЕ ОКОНЧАНИЯ БЕСПЛАТНЫХ ───────────────────────
 async def send_retention_messages(context: ContextTypes.DEFAULT_TYPE):
     """Раз в неделю шлёт тёплое сообщение тем, у кого кончились бесплатные прогнозы."""
@@ -575,6 +705,7 @@ async def show_main_menu(message, context, name=None, edit=False):
     has_retro = context.user_data.get("has_retro_personal")
     keyboard = [
         [InlineKeyboardButton("🌙 фазы луны", callback_data="menu_lunation")],
+        [InlineKeyboardButton("☀️ движение солнца сейчас", callback_data="menu_sun")],
         [InlineKeyboardButton("☿ ретроградный меркурий", callback_data="menu_mercury")],
     ]
     if has_retro:
@@ -660,16 +791,21 @@ def _cache_retro_flag(user_id, context, retrograde):
     save_user(user_id, saved)
 
 async def show_buy_menu(message, context, user_id, edit=False):
+    unlimited = has_active_unlimited(user_id)
     keyboard = []
     for k, p in SUBSCRIPTION_PLANS.items():
-        if has_subscription(user_id, k):
+        # безлимит активен — год/месяц показываем как активные
+        if unlimited and k in ("full_year", "month"):
             keyboard.append([InlineKeyboardButton(f"✅ {p['name']} — активна", callback_data="noop")])
         else:
             keyboard.append([InlineKeyboardButton(f"{p['name']} — {p['label']}", callback_data=f"buy_plan_{k}")])
     keyboard.append([InlineKeyboardButton("← назад", callback_data="back_to_menu")])
     used = get_free_used(user_id)
     limit = get_free_limit(user_id)
-    text = f"🛒 *подписки*\n\nбесплатно использовано: {used} из {limit} прогнозов\n\nрасширенные возможности:"
+    if unlimited:
+        text = "🛒 *подписки*\n\n✨ у тебя активен безлимит — все прогнозы доступны.\n\nможно докупить:"
+    else:
+        text = f"🛒 *подписки*\n\nбесплатно использовано: {used} из {limit} прогнозов\n\nрасширенные возможности:"
     mk = InlineKeyboardMarkup(keyboard)
     if edit:
         await message.edit_text(text, reply_markup=mk, parse_mode="Markdown")
@@ -877,6 +1013,28 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.message.reply_text("что-то ещё?" + footer, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return MAIN_MENU
 
+    elif query.data == "menu_sun":
+        # движение солнца — всегда бесплатно, не считается в лимит
+        name = context.user_data.get("name", "")
+        await query.edit_message_text("☀️ смотрю где сейчас твоё солнце...")
+        chart = calculate_natal_chart(
+            context.user_data.get("birth_date", ""),
+            context.user_data.get("birth_time", ""),
+            context.user_data.get("birth_city", "")
+        )
+        if "error" in chart:
+            await query.message.reply_text(f"ошибка расчёта: {chart['error']}")
+            return MAIN_MENU
+        _cache_retro_flag(user_id, context, chart.get("_retrograde", []))
+        forecast = await get_sun_transit_forecast(name, chart)
+        await query.message.reply_text(forecast)
+        keyboard = [[InlineKeyboardButton("← вернуться в меню", callback_data="back_to_menu")]]
+        await query.message.reply_text(
+            "что дальше?\n\n_это всегда бесплатно ☀️_",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+        )
+        return MAIN_MENU
+
     elif query.data == "menu_lunation":
         return await show_lunation_choice(query.message, context, edit=True)
 
@@ -1037,15 +1195,20 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("reset", reset))
 
-    # ежедневная проверка новолуний (10:00 UTC)
-    app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
-    # напоминалка раз в неделю
-    app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
+    # планировщик (если job_queue доступен — нужен extra [job-queue] в requirements)
+    if app.job_queue is not None:
+        # ежедневная проверка новолуний (10:00 UTC)
+        app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
+        # ежедневная проверка перехода солнца в новый дом
+        app.job_queue.run_daily(send_sun_house_notifications, time=datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=timezone.utc))
+        # напоминалка раз в неделю
+        app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
+    else:
+        logger.warning("job_queue недоступен — уведомления отключены. добавь python-telegram-bot[job-queue] в requirements.")
 
     print("🌙 astro bushido bot запущен")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
 
