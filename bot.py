@@ -35,27 +35,27 @@ if YOOKASSA_SHOP_ID and YOOKASSA_SECRET:
     Configuration.secret_key = YOOKASSA_SECRET
 
 SUBSCRIPTION_PLANS = {
-    "mercury_year": {
-        "name": "☿ все меркурии на год",
-        "desc": "персональный разбор каждого ретроградного меркурия 2026 — все периоды сразу.",
-        "price": "990.00",
-        "label": "990 ₽",
-    },
-    "planets_year": {
-        "name": "🪐 все ретроградные планеты",
-        "desc": "венера, марс, юпитер, сатурн и другие — персональный разбор на весь год.",
-        "price": "1990.00",
-        "label": "1 990 ₽",
-    },
     "full_year": {
-        "name": "✨ полный годовой прогноз",
-        "desc": "все фазы луны + все ретроградности + транзиты на 2026.",
-        "price": "3990.00",
-        "label": "3 990 ₽",
+        "name": "✨ безлимит на весь год",
+        "desc": "все виды прогнозов без ограничений на 1 год — включая новые, которые буду добавлять в течение года.",
+        "price": "7000.00",
+        "label": "7 000 ₽",
+    },
+    "month": {
+        "name": "🌙 безлимит на месяц",
+        "desc": "все виды прогнозов без ограничений на 1 месяц.",
+        "price": "500.00",
+        "label": "500 ₽",
+    },
+    "single": {
+        "name": "🔮 один прогноз",
+        "desc": "один персональный прогноз на выбор.",
+        "price": "150.00",
+        "label": "150 ₽",
     },
 }
 
-NAME, CONSENT, BIRTH_DATE, BIRTH_TIME, BIRTH_CITY, MAIN_MENU = range(6)
+NAME, BIRTH_DATE, BIRTH_TIME, BIRTH_CITY, MAIN_MENU = range(5)
 LUNATIONS_PER_PAGE = 8
 
 logging.basicConfig(level=logging.INFO)
@@ -396,7 +396,6 @@ SYSTEM_ASTRO = """ты — астролог катерина. пишешь ко�
 • весь ответ — максимум 3 абзаца + 3 вопроса. не больше."""
 
 async def get_astro_forecast(name, chart, lunation_jd, lunation_type):
-    chart = dict(chart)
     cusps = chart.pop("_cusps", None)
     retrograde = chart.pop("_retrograde", None) or []
     chart.pop("_lat", None); chart.pop("_lon", None)
@@ -632,11 +631,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "привет, дорогие! 🌙 на связи катерина.\n\n"
         "это мой бот, где можно настроиться на лунные и планетарные ритмы, задать себе вопросы и отслеживать как астрология проявляется в твоей жизни каждый месяц ✨\n\n"
-        "сама много лет наблюдаю за этим — это правда улучшает качество жизни и помогает лучше понимать себя."
+        "сама много лет наблюдаю за этим — это улучшает моё качество жизни.\n\n"
+        "здесь у тебя будет персональный, точный прогноз по твоим данным, информация что происходит и куда что попадает. не забывай отвечать себе на вопросы и чувствовать тело.\n\n"
+        "тело — то, что держит огонь тёплым. огонь — это наше видение и чувство направления.\n\n"
+        "рекомендую сонастраиваться с прогнозами, как они ощущаются в теле, выдыхай и сканируй себя — это заставит любой прогноз работать на тебя."
     )
     await update.message.reply_text(
         "спасибо за твой интерес, как я могу к тебе обращаться?\n\n"
-        f"оставляя имя, вы соглашаетесь на обработку персональных данных, а так же принимаете [политику конфиденциальности]({PRIVACY_POLICY_URL}) и договор публичной оферты."
+        f"оставляя имя, ты соглашаешься на обработку персональных данных, принимаешь [политику конфиденциальности]({PRIVACY_POLICY_URL}) и договор публичной оферты."
     )
     return NAME
 
@@ -705,7 +707,6 @@ async def show_lunation_choice(message, context, edit=False, page=0):
 
 async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
     user_id = update.effective_user.id
     # callback может быть lun_N или nm_notify_N
     idx = int(query.data.split("_")[-1])
@@ -919,27 +920,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     context.user_data["name"] = name
+    context.user_data["consent_at"] = datetime.now(timezone.utc).isoformat()
     await update.message.reply_text(
-        f"{name}, садись поудобнее 🌙\n\n"
-        "для персональных прогнозов мне нужны данные твоего рождения.\n\n"
-        "нажимая «соглашаюсь», ты подтверждаешь согласие на обработку данных.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ соглашаюсь", callback_data="consent_yes")],
-            [InlineKeyboardButton("❌ не соглашаюсь", callback_data="consent_no")],
-        ]),
-        parse_mode="Markdown", disable_web_page_preview=True
+        f"{name}, садись поудобнее 🌙\n\nвведи дату рождения в формате дд.мм.гггг\nнапример: 31.03.1997"
     )
-    return CONSENT
-
-async def get_consent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    if query.data == "consent_yes":
-        context.user_data["consent_at"] = datetime.now(timezone.utc).isoformat()
-        await query.edit_message_text("отлично! 🙏\n\nвведи дату рождения в формате дд.мм.гггг\nнапример: 31.03.1997")
-        return BIRTH_DATE
-    await query.edit_message_text("хорошо. если передумаешь — /start")
-    return ConversationHandler.END
+    return BIRTH_DATE
 
 async def get_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     date_text = update.message.text.strip()
@@ -983,22 +968,19 @@ async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await show_main_menu(update.message, context, context.user_data["name"])
     return MAIN_MENU
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сброс данных текущего пользователя — можно начать заново."""
-    user_id = update.effective_user.id
-    data = load_user_data()
-    if str(user_id) in data:
-        del data[str(user_id)]
-        save_user_data(data)
-    context.user_data.clear()
-    await update.message.reply_text(
-        "🧹 твои данные удалены. можно начать заново — нажми /start 🌙"
-    )
-    return ConversationHandler.END
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("отменено. /start чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_user_data()
+    uid = str(user_id)
+    if uid in data:
+        del data[uid]
+        save_user_data(data)
+    context.user_data.clear()
+    await update.message.reply_text("🔄 данные удалены. напиши /start чтобы начать заново.")
 
 
 # ── СТАТИСТИКА (только для админа) ───────────────────────────────
@@ -1041,7 +1023,6 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            CONSENT: [CallbackQueryHandler(get_consent, pattern="^consent_")],
             BIRTH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_birth_date)],
             BIRTH_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_birth_time)],
             BIRTH_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_birth_city)],
@@ -1056,18 +1037,15 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("reset", reset))
 
-    # фоновые задачи работают только если установлен job-queue
-    if app.job_queue is not None:
-        # ежедневная проверка новолуний (10:00 UTC)
-        app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
-        # напоминалка раз в неделю
-        app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
-    else:
-        logger.warning("job_queue недоступен — установи python-telegram-bot[job-queue]. авто-уведомления отключены.")
+    # ежедневная проверка новолуний (10:00 UTC)
+    app.job_queue.run_daily(send_newmoon_notifications, time=datetime.strptime("10:00", "%H:%M").time().replace(tzinfo=timezone.utc))
+    # напоминалка раз в неделю
+    app.job_queue.run_repeating(send_retention_messages, interval=timedelta(days=7), first=timedelta(hours=1))
 
     print("🌙 astro bushido bot запущен")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
 
