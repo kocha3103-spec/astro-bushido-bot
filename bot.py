@@ -26,7 +26,9 @@ MODEL = "claude-opus-4.6"
 USER_DATA_FILE = os.environ.get("USER_DATA_FILE", "/data/user_data.json")
 COMMUNITY_LINK = "https://t.me/astro_bushido"
 KATYA_TG = "katerinakocha"
-PRIVACY_POLICY_URL = "https://telegra.ph/privacy-astro-bushido"
+PDPA_URL = "https://docs.google.com/document/d/1_vgWqlkUaRYP0BX9oK3ZOlvgB6SJO1fa/edit?usp=sharing&ouid=116341699354892317088&rtpof=true&sd=true"
+PRIVACY_POLICY_URL = "https://docs.google.com/document/d/1ZAL8gRNz12jiMZVl-TdJzNw8vDBP4YRy/edit?usp=sharing&ouid=116341699354892317088&rtpof=true&sd=true"
+OFERTA_URL = "https://docs.google.com/document/d/1QT5lUJ3Mt4lqeoY_DmjrHSH3xRo4vr3v/edit?usp=sharing&ouid=116341699354892317088&rtpof=true&sd=true"
 BOT_USERNAME = "astro_bushido_bot"
 FREE_FORECASTS_LIMIT = 4
 
@@ -517,7 +519,7 @@ async def get_sun_transit_forecast(name, chart):
     for k, v in chart.items():
         if k.startswith("_") or k in ("Асцендент", "MC"):
             continue
-        if f"{house} дом" in v:
+        if f", {house} дом" in v:
             planets_here.append(k)
     planets_text = (
         f"в этом доме есть натальные планеты: {', '.join(planets_here)}"
@@ -536,8 +538,10 @@ async def get_sun_transit_forecast(name, chart):
 • солнце сейчас проходит через определённый дом — расскажи какие темы этого дома поднимаются и подсвечиваются.
 • если в этом доме есть натальные планеты — упомяни коротко (это усиливает темы). если нет — так и скажи.
 
+⚠️ номер дома уже указан пользователю отдельно — НЕ называй другой номер дома, используй ровно тот, что дан в данных ниже. не пиши «в 5 доме» если дано 7.
+
 ═══ ФОРМАТ ═══
-• начинай с: "[имя], сейчас твоё солнце в [N] доме"
+• не повторяй номер дома в начале (он уже показан). сразу переходи к темам этого дома.
 • 2-3 коротких абзаца. тепло, на ты, с маленькой буквы.
 • в конце 3 вопроса: про эту сферу, есть ли сдвиг в этой теме, и про телесные ощущения.""" + sources_block
     user = f"""имя: {name}
@@ -554,6 +558,8 @@ async def show_paywall(message, user_id, edit=False):
     limit = get_free_limit(user_id)
     text = (
         f"🌙 ты использовала все {limit} бесплатных прогноза\n\n"
+        "у меня в планах добавить затмения, другие планеты и модуль с human design.\n\n"
+        "а из ближайшего — осенью нас ожидает ретроградная венера 🌙\n\n"
         "чтобы продолжить — выбери подписку:\n\n"
         + "\n".join(f"*{p['name']}* — {p['label']}\n{p['desc']}" for p in SUBSCRIPTION_PLANS.values())
     )
@@ -638,7 +644,7 @@ async def send_sun_house_notifications(context: ContextTypes.DEFAULT_TYPE):
         name = udata.get("name", "")
         planets_here = [
             k for k, v in chart.items()
-            if not k.startswith("_") and k not in ("Асцендент", "MC") and f"{house} дом" in v
+            if not k.startswith("_") and k not in ("Асцендент", "MC") and f", {house} дом" in v
         ]
         planets_line = (
             f"и тут у тебя есть планеты: {', '.join(planets_here)} — темы будут ярче"
@@ -711,7 +717,7 @@ async def show_main_menu(message, context, name=None, edit=False):
     if has_retro:
         keyboard.append([InlineKeyboardButton("⚡️ забери свой бонус", callback_data="menu_bonus")])
     keyboard += [
-        [InlineKeyboardButton("🔗 пригласи подругу — получи прогноз", callback_data="menu_referral")],
+        [InlineKeyboardButton("🔗 поделиться с другом — получи прогноз", callback_data="menu_referral")],
         [InlineKeyboardButton("🛒 подписки", callback_data="menu_buy")],
         [InlineKeyboardButton("💬 служба заботы — написать кате", url=f"https://t.me/{KATYA_TG}")],
     ]
@@ -733,17 +739,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if referrer_id != str(user_id) and not get_user(user_id):
             add_bonus_forecast(referrer_id)
 
-    # возврат после оплаты
+    # возврат после оплаты — берём тариф из сохранённого pending (надёжно)
     if args and args[0].startswith("paid_"):
-        parts = args[0].split("_", 2)
-        if len(parts) == 3:
-            plan_key = parts[1] + "_" + parts[2].split("_")[0]
-            saved = get_user(user_id) or {}
-            pid = saved.get("pending_payment_id")
-            if pid and check_payment(pid):
-                grant_subscription(user_id, plan_key)
-                plan = SUBSCRIPTION_PLANS.get(plan_key, {})
-                await update.message.reply_text(f"✅ оплата прошла! *{plan.get('name','')}* активирована 🌙", parse_mode="Markdown")
+        saved = get_user(user_id) or {}
+        pid = saved.get("pending_payment_id")
+        plan_key = saved.get("pending_plan_key")
+        if pid and plan_key and check_payment(pid):
+            grant_subscription(user_id, plan_key)
+            await notify_admin_payment(context, user_id, plan_key)
+            plan = SUBSCRIPTION_PLANS.get(plan_key, {})
+            await update.message.reply_text(f"✅ оплата прошла! *{plan.get('name','')}* активирована 🌙", parse_mode="Markdown")
 
     saved = get_user(user_id)
     if saved:
@@ -760,16 +765,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     # новый пользователь — 2 отдельных сообщения
     await update.message.reply_text(
-        "привет, дорогие! 🌙 на связи катерина.\n\n"
-        "это мой бот, где можно настроиться на лунные и планетарные ритмы, задать себе вопросы и отслеживать как астрология проявляется в твоей жизни каждый месяц ✨\n\n"
-        "сама много лет наблюдаю за этим — это улучшает моё качество жизни.\n\n"
-        "здесь у тебя будет персональный, точный прогноз по твоим данным, информация что происходит и куда что попадает. не забывай отвечать себе на вопросы и чувствовать тело.\n\n"
-        "тело — то, что держит огонь тёплым. огонь — это наше видение и чувство направления.\n\n"
+        "привет, друг! 🌙 на связи катерина.\n\n"
+        "это мой бот, где можно настроиться на космические ритмы, задать себе вопросы и отслеживать как астрология проявляется в твоей жизни каждый месяц ✨\n\n"
+        "сама много лет наблюдаю за этим — это улучшает моё состояние.\n\n"
+        "здесь у тебя будет персональный, точный прогноз по твоим данным, информация что происходит и на что обращать внимание.\n\n"
         "рекомендую сонастраиваться с прогнозами, как они ощущаются в теле, выдыхай и сканируй себя — это заставит любой прогноз работать на тебя."
     )
     await update.message.reply_text(
         "спасибо за твой интерес, как я могу к тебе обращаться?\n\n"
-        f"оставляя имя, ты соглашаешься на обработку персональных данных, принимаешь [политику конфиденциальности]({PRIVACY_POLICY_URL}) и договор публичной оферты."
+        f"оставляя имя, ты соглашаешься на [обработку персональных данных]({PDPA_URL}), "
+        f"принимаешь [политику конфиденциальности]({PRIVACY_POLICY_URL}) "
+        f"и [договор публичной оферты]({OFERTA_URL}).",
+        parse_mode="Markdown",
+        disable_web_page_preview=True
     )
     return NAME
 
@@ -900,7 +908,7 @@ async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_T
         footer = f"\n\n_осталось бесплатных прогнозов: {max(0, remaining)}_"
     else:
         footer = "\n\n_этот прогноз всегда бесплатный — подарок к каждому новолунию 🌙_"
-    await query.message.reply_text("что дальше?" + footer, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await query.message.reply_text("хочешь перейти в другой прогноз?" + footer, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     return MAIN_MENU
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -932,13 +940,29 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         plan = SUBSCRIPTION_PLANS.get(plan_key)
         if not plan:
             return MAIN_MENU
+        # оплата ещё не подключена
+        if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET):
+            keyboard = [
+                [InlineKeyboardButton("💬 написать кате", url=f"https://t.me/{KATYA_TG}")],
+                [InlineKeyboardButton("← главное меню", callback_data="back_to_menu")],
+            ]
+            await query.edit_message_text(
+                "💫 оплата скоро подключится!\n\nа пока — напиши кате напрямую, и она всё оформит вручную 🌙",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return MAIN_MENU
         await query.edit_message_text("⏳ создаю ссылку на оплату...")
         result = create_payment(user_id, plan_key)
         if not result:
-            await query.message.reply_text("ошибка создания платежа. попробуй позже.")
+            keyboard = [[InlineKeyboardButton("← главное меню", callback_data="back_to_menu")]]
+            await query.message.reply_text(
+                "не получилось создать ссылку на оплату 😔 попробуй позже или напиши кате.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return MAIN_MENU
         saved = get_user(user_id) or {}
         saved["pending_payment_id"] = result["payment_id"]
+        saved["pending_plan_key"] = plan_key
         save_user(user_id, saved)
         keyboard = [
             [InlineKeyboardButton(f"💳 оплатить {plan['label']}", url=result["url"])],
@@ -957,6 +981,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if check_payment(payment_id):
             grant_subscription(user_id, plan_key)
             plan = SUBSCRIPTION_PLANS.get(plan_key, {})
+            await notify_admin_payment(context, user_id, plan_key)
             keyboard = [[InlineKeyboardButton("← главное меню", callback_data="back_to_menu")]]
             await query.edit_message_text(
                 f"✅ *оплата подтверждена!*\n\n*{plan.get('name','')}* активирована. спасибо! 🌙",
@@ -1026,11 +1051,14 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.message.reply_text(f"ошибка расчёта: {chart['error']}")
             return MAIN_MENU
         _cache_retro_flag(user_id, context, chart.get("_retrograde", []))
+        # номер дома — из кода (факт), нейросеть только описывает темы
+        _, sun_sign, sun_deg, sun_house = get_sun_transit(chart.get("_cusps"))
+        header = f"☀️ {name}, сейчас твоё солнце в *{sun_house} доме* ({SIGNS_EMOJI.get(sun_sign,'')}{sun_sign} {sun_deg}°)\n\n"
         forecast = await get_sun_transit_forecast(name, chart)
-        await query.message.reply_text(forecast)
+        await query.message.reply_text(header + forecast, parse_mode="Markdown")
         keyboard = [[InlineKeyboardButton("← вернуться в меню", callback_data="back_to_menu")]]
         await query.message.reply_text(
-            "что дальше?\n\n_это всегда бесплатно ☀️_",
+            "что дальше?\n\n_солнце доступно тебе всегда ☀️_",
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
         )
         return MAIN_MENU
@@ -1089,7 +1117,7 @@ async def get_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         datetime.strptime(date_text, "%d.%m.%Y")
         context.user_data["birth_date"] = date_text
-        await update.message.reply_text("теперь время рождения в формате чч:мм\nнапример: 23:48\n\nне знаешь точно — пиши 12:00")
+        await update.message.reply_text("теперь время рождения в формате чч:мм\nнапример: 4:44\n\nне знаешь точно — пиши 12:00, но лучше сделать ректификацию у специалиста. для точных рабочих прогнозов время очень важно.")
         return BIRTH_TIME
     except ValueError:
         await update.message.reply_text("формат: дд.мм.гггг, например 31.03.1997")
@@ -1100,7 +1128,7 @@ async def get_birth_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         datetime.strptime(time_text, "%H:%M")
         context.user_data["birth_time"] = time_text
-        await update.message.reply_text("и город рождения:")
+        await update.message.reply_text("и город рождения:\n\nлучше подписывай с областью, если у тебя маленький город")
         return BIRTH_CITY
     except ValueError:
         await update.message.reply_text("формат: чч:мм, например 23:48")
@@ -1172,6 +1200,86 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+async def notify_admin_payment(context, user_id, plan_key):
+    """Мгновенное уведомление админу о новой оплате."""
+    if not ADMIN_ID:
+        return
+    user = get_user(user_id) or {}
+    name = user.get("name", "—")
+    plan = SUBSCRIPTION_PLANS.get(plan_key, {})
+    when = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    try:
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"💰 новая оплата!\n\n"
+            f"👤 {name} (id {user_id})\n"
+            f"📦 {plan.get('name', plan_key)} — {plan.get('label', '')}\n"
+            f"🕐 {when}"
+        )
+    except Exception as e:
+        logger.warning(f"admin payment notify: {e}")
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список пользователей — только для админа."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    data = load_user_data()
+    registered = [(uid, u) for uid, u in data.items() if u.get("name")]
+    if not registered:
+        await update.message.reply_text("пока нет пользователей.")
+        return
+    lines = [f"👥 *пользователи ({len(registered)})*\n"]
+    for uid, u in registered:
+        reg = u.get("registered_at", "")[:10]
+        subs = u.get("subscriptions", {})
+        active = "💎" if has_active_unlimited(int(uid)) else ""
+        lines.append(
+            f"{active} *{u.get('name','—')}* — {u.get('birth_date','?')} {u.get('birth_time','')}, {u.get('birth_city','')}"
+            + (f"\n  рег: {reg}" if reg else "")
+        )
+    # телеграм ограничивает длину — режем на части по 3500 символов
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await update.message.reply_text(text[i:i+3500], parse_mode="Markdown")
+
+async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список всех оплат — только для админа."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    data = load_user_data()
+    all_pays = []
+    for uid, u in data.items():
+        for p in u.get("payments", []):
+            all_pays.append((p.get("at", ""), u.get("name", "—"), uid, p.get("plan", "")))
+    all_pays.sort(reverse=True)
+    if not all_pays:
+        await update.message.reply_text("пока нет оплат.")
+        return
+    lines = [f"💳 *оплаты ({len(all_pays)})*\n"]
+    for at, name, uid, plan_key in all_pays:
+        plan = SUBSCRIPTION_PLANS.get(plan_key, {})
+        when = at[:16].replace("T", " ")
+        lines.append(f"*{name}* — {plan.get('name', plan_key)} {plan.get('label','')}\n  {when}")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await update.message.reply_text(text[i:i+3500], parse_mode="Markdown")
+
+
+# ── ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ─────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("ошибка в обработчике:", exc_info=context.error)
+    try:
+        if isinstance(update, Update):
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("← главное меню", callback_data="back_to_menu")]])
+            msg = "что-то пошло не так 😔 давай вернёмся в меню — нажми /start если кнопка не сработает."
+            if update.callback_query:
+                await update.callback_query.answer()
+                await update.callback_query.message.reply_text(msg, reply_markup=keyboard)
+            elif update.message:
+                await update.message.reply_text(msg, reply_markup=keyboard)
+    except Exception as e:
+        logger.warning(f"error_handler не смог ответить: {e}")
+
 
 # ── ЗАПУСК ───────────────────────────────────────────────────────
 def main():
@@ -1193,7 +1301,10 @@ def main():
     )
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("payments", payments_cmd))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_error_handler(error_handler)
 
     # планировщик (если job_queue доступен — нужен extra [job-queue] в requirements)
     if app.job_queue is not None:
@@ -1211,4 +1322,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
