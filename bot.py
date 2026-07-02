@@ -2,7 +2,7 @@ import os
 import logging
 import json
 import httpx
-import swisseph as swe
+import swisseph as sweh
 from geopy.geocoders import Nominatim
 from tzfpy import get_tz
 from datetime import datetime, timezone, timedelta
@@ -558,9 +558,8 @@ async def show_paywall(message, user_id, edit=False):
     limit = get_free_limit(user_id)
     text = (
         f"🌙 ты использовала все {limit} бесплатных прогноза\n\n"
-        "у меня в планах добавить затмения, другие планеты и модуль с human design.\n\n"
-        "а из ближайшего — осенью нас ожидает ретроградная венера 🌙\n\n"
-        "чтобы продолжить — выбери подписку:\n\n"
+        "можешь поделиться со мной отзывом — написать кате — или выбери подписку\n\n"
+        "везучих и счастливых прогнозов\n\n"
         + "\n".join(f"*{p['name']}* — {p['label']}\n{p['desc']}" for p in SUBSCRIPTION_PLANS.values())
     )
     keyboard = [
@@ -813,7 +812,13 @@ async def show_buy_menu(message, context, user_id, edit=False):
     if unlimited:
         text = "🛒 *подписки*\n\n✨ у тебя активен безлимит — все прогнозы доступны.\n\nможно докупить:"
     else:
-        text = f"🛒 *подписки*\n\nбесплатно использовано: {used} из {limit} прогнозов\n\nрасширенные возможности:"
+        text = (
+            f"🛒 *подписки*\n\n"
+            f"бесплатно использовано: {used} из {limit} прогнозов\n\n"
+            "расширенные возможности:\n\n"
+            "у меня в планах добавить затмения, другие планеты и модуль с human design, "
+            "а из ближайшего — осенью нас ожидает ретроградная венера"
+        )
     mk = InlineKeyboardMarkup(keyboard)
     if edit:
         await message.edit_text(text, reply_markup=mk, parse_mode="Markdown")
