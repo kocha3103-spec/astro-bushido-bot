@@ -1,8 +1,9 @@
 import os
+import asyncio
 import logging
 import json
 import httpx
-import swisseph as sweh
+import swisseph as swe
 from geopy.geocoders import Nominatim
 from tzfpy import get_tz
 from datetime import datetime, timezone, timedelta
@@ -69,6 +70,8 @@ SIGNS_EMOJI = {"Овен":"♈","Телец":"♉","Близнецы":"♊","Р�
 
 _LUNATIONS_CACHE = None
 _LUNATIONS_CACHE_DATE = None
+_ECLIPSES_CACHE = None
+_ECLIPSES_CACHE_DATE = None
 
 
 # ── ХРАНЕНИЕ ДАННЫХ ──────────────────────────────────────────────
@@ -89,6 +92,20 @@ def save_user_data(data):
     _ensure_data_dir()
     with open(USER_DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+PROMO_FILE = os.path.join(os.path.dirname(USER_DATA_FILE) or ".", "promocodes.json")
+
+def load_promos():
+    try:
+        with open(PROMO_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_promos(promos):
+    _ensure_data_dir()
+    with open(PROMO_FILE, "w", encoding="utf-8") as f:
+        json.dump(promos, f, ensure_ascii=False, indent=2)
 
 def get_user(user_id):
     return load_user_data().get(str(user_id))
@@ -239,9 +256,11 @@ def get_coordinates(city_name):
     except Exception:
         return None, None
 
-def calculate_natal_chart(birth_date, birth_time, city):
+def calculate_natal_chart(birth_date, birth_time, city, lat=None, lon_geo=None):
     try:
-        lat, lon_geo = get_coordinates(city)
+        # координаты берём из сохранённых (быстро и надёжно); геокодер — только если их нет
+        if lat is None or lon_geo is None:
+            lat, lon_geo = get_coordinates(city)
         if lat is None:
             return {"error": f"не удалось найти город: {city}"}
         tzname = get_tz(lon_geo, lat)
@@ -280,6 +299,13 @@ def calculate_natal_chart(birth_date, birth_time, city):
         return chart
     except Exception as e:
         return {"error": str(e)}
+
+def chart_for(u):
+    """Строит карту из данных пользователя, используя сохранённые координаты."""
+    return calculate_natal_chart(
+        u.get("birth_date", ""), u.get("birth_time", ""), u.get("birth_city", ""),
+        u.get("lat"), u.get("lon"),
+    )
 
 def _refine_lunation(lo, hi, target):
     for _ in range(50):
@@ -327,6 +353,66 @@ def find_lunations_year():
     _LUNATIONS_CACHE = results
     _LUNATIONS_CACHE_DATE = today
     return results
+
+def find_eclipses_year():
+    """Все солнечные и лунные затмения на ~13 месяцев вперёд (Swiss Ephemeris)."""
+    global _ECLIPSES_CACHE, _ECLIPSES_CACHE_DATE
+    today = datetime.now(timezone.utc).date()
+    if _ECLIPSES_CACHE is not None and _ECLIPSES_CACHE_DATE == today:
+        return _ECLIPSES_CACHE
+    now = datetime.now(timezone.utc)
+    jd_start = swe.julday(now.year, now.month, now.day, 0)
+    jd_end = jd_start + 400
+    raw = []
+    # солнечные затмения
+    t = jd_start
+    for _ in range(12):
+        try:
+            retflag, tret = swe.sol_eclipse_when_glob(t, swe.FLG_SWIEPH, 0, False)
+        except Exception:
+            break
+        jd_max = tret[0]
+        if jd_max > jd_end:
+            break
+        if retflag & swe.ECL_TOTAL:
+            kind = "полное"
+        elif retflag & swe.ECL_ANNULAR:
+            kind = "кольцевое"
+        else:
+            kind = "частичное"
+        raw.append(("СЗ", kind, jd_max))
+        t = jd_max + 1
+    # лунные затмения
+    t = jd_start
+    for _ in range(12):
+        try:
+            retflag, tret = swe.lun_eclipse_when(t, swe.FLG_SWIEPH, 0, False)
+        except Exception:
+            break
+        jd_max = tret[0]
+        if jd_max > jd_end:
+            break
+        if retflag & swe.ECL_TOTAL:
+            kind = "полное"
+        elif retflag & swe.ECL_PARTIAL:
+            kind = "частичное"
+        else:
+            kind = "полутеневое"
+        raw.append(("ЛЗ", kind, jd_max))
+        t = jd_max + 1
+    # позиции: солнечное = точка Солнца/Луны (новолуние), лунное = точка Луны (полнолуние)
+    out = []
+    for etype, kind, jd_max in raw:
+        body = swe.SUN if etype == "СЗ" else swe.MOON
+        lon = swe.calc_ut(jd_max, body)[0][0] % 360
+        sign, deg = fmt_position(lon)
+        y, m, d, h = swe.revjul(jd_max)
+        date_str = f"{int(d):02d}.{int(m):02d}.{int(y)}"
+        out.append((etype, kind, date_str, sign, deg, jd_max, lon))
+    out.sort(key=lambda x: x[5])
+    _ECLIPSES_CACHE = out
+    _ECLIPSES_CACHE_DATE = today
+    return out
 
 def find_mercury_retro():
     now = datetime.now(timezone.utc)
@@ -426,14 +512,23 @@ SYSTEM_ASTRO = """ты — астролог катерина. пишешь ко�
 • по-русски, с маленькой буквы, на ты.
 • тепло и конкретно. короткие живые предложения.
 • как подруга-астролог, не академический разбор.
+• НО: ты не утешаешь. ты будишь. тёплая — не значит удобная.
+
+═══ ЯСНОСТЬ ВМЕСТО УТЕШЕНИЯ (важно!) ═══
+• твоя задача — не успокоить и не пнуть, а ПРОЯСНИТЬ. открыть глаза — мягко.
+• трансформация происходит, когда человек относится к себе с поддержкой — и к тёмным сторонам, и к светлым. поэтому неудобное называй с теплом, без обвинения: не «ты избегаешь», а «в этой теме часто есть то, на что трудно смотреть — и это нормально».
+• пустые утешения запрещены: «всё будет хорошо», «доверься процессу», «вселенная поддержит» — они ничего не проясняют. но ВЕРА уместна: «это можно прожить», «ты справлялась со сложным — и это пройдёшь». вера — мягкое и сильное одновременно, не сироп.
+• не давай готовых выводов — оставляй пространство додумать. недосказанность — это приглашение, а не обрыв.
+• один вопрос — ПРОЯСНЯЮЩИЙ, глубокий. не пинок в лоб, а открывающий глаза: «что станет видно, если посмотреть на это честно?», «что ты уже знаешь, но пока не готова себе сказать?», «чему в этой сфере пора дать место?»
 
 ═══ ФОРМАТ (строго) ═══
 • начинай с: "твой прогноз по [новолунию/полнолунию] в [знак] на [период]"
 • 2-3 коротких абзаца про эту фазу луны.
 • в конце — 3 вопроса для рефлексии:
   1. вопрос про эту сферу жизни (дом фазы)
-  2. как это проявляется у тебя прямо сейчас?
+  2. один ПРОЯСНЯЮЩИЙ вопрос — глубокий, открывающий глаза (см. выше)
   3. ОБЯЗАТЕЛЬНО про телесные ощущения — где в теле чувствуешь это напряжение или лёгкость?
+• после вопросов — по ситуации: если тема тяжёлая, можно ОДНУ короткую строку опоры (вера, не утешение: «это можно прожить»). если нет — оставь тишину, пусть вопросы работают.
 • весь ответ — максимум 3 абзаца + 3 вопроса. не больше."""
 
 async def get_astro_forecast(name, chart, lunation_jd, lunation_type):
@@ -445,7 +540,7 @@ async def get_astro_forecast(name, chart, lunation_jd, lunation_type):
     lunation_text = f"{type_name} {date_s} — луна в {sign} {deg}°, {house} дом"
     chart_text = "\n".join(f"  {k}: {v}" for k, v in chart.items())
     query = build_query(lunation_type, sign, house, [r[0] for r in retrograde] + list(chart.keys())[:4])
-    source_context = retrieve(query)
+    source_context = await asyncio.to_thread(retrieve, query)
     sources_block = f"\n\n═══ АВТОРСКИЕ МАТЕРИАЛЫ (приоритет) ═══\n{source_context}" if source_context else ""
     return await call_claude(SYSTEM_ASTRO + sources_block, f"""имя: {name}
 натальная карта (плацидус):
@@ -481,7 +576,7 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
     period = f"{retro_info['start_date']} — {retro_info['end_date']}"
     chart_text = "\n".join(f"  {k}: {v}" for k, v in chart.items() if not k.startswith("_"))
     merc_query = f"ретроградный меркурий транзит {retro_info['start_sign']} {start_house} дом"
-    source_context = retrieve(merc_query)
+    source_context = await asyncio.to_thread(retrieve, merc_query)
     sources_block = f"\n\n═══ АВТОРСКИЕ МАТЕРИАЛЫ (приоритет) ═══\n{source_context}" if source_context else ""
     system = """ты — астролог катерина. пишешь прогноз на период ретроградного меркурия.
 
@@ -498,7 +593,8 @@ async def get_mercury_retro_forecast(name, chart, retro_info):
 ═══ ФОРМАТ ═══
 • начинай с: "твой прогноз на ретроградный меркурий [период]"
 • 2-3 коротких абзаца. тепло, конкретно, на ты.
-• в конце 3 вопроса для рефлексии, последний — про телесные ощущения.""" + sources_block
+• в конце 3 вопроса для рефлексии: один по теме, один ПРОЯСНЯЮЩИЙ (открывающий глаза, не пинающий: «что ты уже знаешь, но пока не готова себе сказать?»), последний — про телесные ощущения.
+• пустые утешения запрещены («всё будет хорошо», «доверься процессу»), но вера уместна: «это можно прожить». не давай готовых выводов — оставляй пространство додумать.""" + sources_block
     user = f"""имя: {name}
 натальная карта:
 {chart_text}
@@ -525,7 +621,7 @@ async def get_sun_transit_forecast(name, chart):
         f"в этом доме есть натальные планеты: {', '.join(planets_here)}"
         if planets_here else "натальных планет в этом доме нет"
     )
-    source_context = retrieve(f"солнце {house} дом транзит солнца тема дома")
+    source_context = await asyncio.to_thread(retrieve, f"солнце {house} дом транзит солнца тема дома")
     sources_block = f"\n\n═══ АВТОРСКИЕ МАТЕРИАЛЫ (приоритет) ═══\n{source_context}" if source_context else ""
     system = """ты — астролог катерина. пишешь короткий прогноз про движение солнца сейчас (транзит солнца по дому).
 
@@ -543,12 +639,59 @@ async def get_sun_transit_forecast(name, chart):
 ═══ ФОРМАТ ═══
 • не повторяй номер дома в начале (он уже показан). сразу переходи к темам этого дома.
 • 2-3 коротких абзаца. тепло, на ты, с маленькой буквы.
-• в конце 3 вопроса: про эту сферу, есть ли сдвиг в этой теме, и про телесные ощущения.""" + sources_block
+• в конце 3 вопроса: про эту сферу, один ПРОЯСНЯЮЩИЙ (чему в этой теме пора дать место?), и про телесные ощущения.
+• пустые утешения запрещены, но вера уместна: «это можно прожить». оставляй пространство додумать самой.""" + sources_block
     user = f"""имя: {name}
 транзитное солнце сейчас: {sign} {deg}°, {house} дом натальной карты
 {planets_text}
 
 составь короткий прогноз про темы этого дома."""
+    return await call_claude(system, user)
+
+async def get_eclipse_forecast(name, chart, ecl):
+    etype, kind, date_str, sign, deg, jd_max, lon = ecl
+    cusps = chart.get("_cusps")
+    if not cusps:
+        return "не удалось рассчитать дома."
+    house = get_house(lon, cusps)
+    planets_here = [
+        k for k, v in chart.items()
+        if not k.startswith("_") and k not in ("Асцендент", "MC") and f", {house} дом" in v
+    ]
+    planets_text = (
+        f"в этом доме есть натальные планеты: {', '.join(planets_here)} — затмение заденет их темы напрямую"
+        if planets_here else "натальных планет в этом доме нет"
+    )
+    type_full = "солнечное затмение (усиленное новолуние)" if etype == "СЗ" else "лунное затмение (усиленное полнолуние)"
+    source_context = await asyncio.to_thread(retrieve, f"затмение {sign} {house} дом луна солнце")
+    sources_block = f"\n\n═══ АВТОРСКИЕ МАТЕРИАЛЫ (приоритет) ═══\n{source_context}" if source_context else ""
+    system = """ты — астролог катерина. пишешь короткий персональный прогноз на затмение.
+
+⛔️ СТРОГО:
+• используй ТОЛЬКО эти 12 знаков: Овен, Телец, Близнецы, Рак, Лев, Дева, Весы, Скорпион, Стрелец, Козерог, Водолей, Рыбы.
+• не анализируй всю карту — только точку затмения и дом, куда она попадает.
+• обращайся точно тем именем, которое написал пользователь.
+• НЕ пугай: никакой кармы-фатальности, «судьба решит за тебя», «опасный период». затмение — не приговор.
+
+✅ СУТЬ:
+• солнечное затмение = усиленное новолуние: в теме дома закрывается старая дверь и открывается новая. старт с глубокой перенастройкой.
+• лунное затмение = усиленное полнолуние: кульминация, на свет выходит то, что зрело месяцами. видно то, что было скрыто.
+• затмения — поворотные точки: события в этой сфере ускоряются, решения имеют больший вес.
+• если в доме затмения есть натальные планеты — темы этих планет включаются напрямую, скажи об этом.
+
+═══ ТОН ═══
+• по-русски, с маленькой буквы, на ты. тепло, ясно, без страшилок и без сиропа.
+• пустые утешения запрещены, но вера уместна: «это можно прожить».
+• не давай готовых выводов — оставляй пространство додумать.
+
+═══ ФОРМАТ ═══
+• 2-3 коротких абзаца.
+• в конце 3 вопроса: про сферу этого дома, один ПРОЯСНЯЮЩИЙ (что в этой теме давно просит перемены?), и про телесные ощущения.""" + sources_block
+    user = f"""имя: {name}
+затмение: {type_full}, {kind}, {date_str} — {sign} {deg}°, {house} дом натальной карты
+{planets_text}
+
+составь персональный прогноз на это затмение."""
     return await call_claude(system, user)
 
 
@@ -623,9 +766,7 @@ async def send_sun_house_notifications(context: ContextTypes.DEFAULT_TYPE):
     for uid_str, udata in data.items():
         if not udata.get("birth_date"):
             continue
-        chart = calculate_natal_chart(
-            udata.get("birth_date", ""), udata.get("birth_time", ""), udata.get("birth_city", "")
-        )
+        chart = chart_for(udata)
         if "error" in chart:
             continue
         cusps = chart.get("_cusps")
@@ -711,6 +852,7 @@ async def show_main_menu(message, context, name=None, edit=False):
     keyboard = [
         [InlineKeyboardButton("🌙 фазы луны", callback_data="menu_lunation")],
         [InlineKeyboardButton("☀️ движение солнца сейчас", callback_data="menu_sun")],
+        [InlineKeyboardButton("🌘 затмения", callback_data="menu_eclipse")],
         [InlineKeyboardButton("☿ ретроградный меркурий", callback_data="menu_mercury")],
     ]
     if has_retro:
@@ -738,6 +880,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if referrer_id != str(user_id) and not get_user(user_id):
             add_bonus_forecast(referrer_id)
 
+
     # возврат после оплаты — берём тариф из сохранённого pending (надёжно)
     if args and args[0].startswith("paid_"):
         saved = get_user(user_id) or {}
@@ -747,7 +890,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             grant_subscription(user_id, plan_key)
             await notify_admin_payment(context, user_id, plan_key)
             plan = SUBSCRIPTION_PLANS.get(plan_key, {})
-            await update.message.reply_text(f"✅ оплата прошла! *{plan.get('name','')}* активирована 🌙", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"✅ *оплата прошла, всё супер!*\n\n"
+                f"*{plan.get('name','')}* активирована 🎉\n\n"
+                f"спасибо за доверие! теперь все прогнозы открыты — исследуй себя 🌙",
+                parse_mode="Markdown"
+            )
+            context.user_data.update(get_user(user_id) or {})
+            await show_main_menu(update.message, context)
+            return MAIN_MENU
 
     saved = get_user(user_id)
     if saved:
@@ -854,6 +1005,67 @@ async def show_lunation_choice(message, context, edit=False, page=0):
         await message.reply_text(text, reply_markup=mk, parse_mode="Markdown")
     return MAIN_MENU
 
+async def show_eclipse_choice(message, context, edit=False):
+    ecls = find_eclipses_year()
+    keyboard = []
+    for i, e in enumerate(ecls):
+        etype, kind, date, sign, deg, jd, lon = e
+        emoji = "🌑" if etype == "СЗ" else "🌕"
+        tname = "солнечное" if etype == "СЗ" else "лунное"
+        sign_e = SIGNS_EMOJI.get(sign, "")
+        keyboard.append([InlineKeyboardButton(f"{emoji} {date} {tname} {sign_e}{sign} {deg}°", callback_data=f"ecl_{i}")])
+    keyboard.append([InlineKeyboardButton("← меню", callback_data="back_to_menu")])
+    text = (
+        "🌘 ближайшие затмения — выбери для персонального разбора:\n\n"
+        "_затмения — усиленные новолуния и полнолуния, поворотные точки года_"
+    )
+    mk = InlineKeyboardMarkup(keyboard)
+    if edit:
+        await message.edit_text(text, reply_markup=mk, parse_mode="Markdown")
+    else:
+        await message.reply_text(text, reply_markup=mk, parse_mode="Markdown")
+    return MAIN_MENU
+
+async def handle_eclipse_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    user_id = update.effective_user.id
+    idx = int(query.data.split("_")[1])
+    ecls = find_eclipses_year()
+    if idx >= len(ecls):
+        await query.edit_message_text("что-то пошло не так. /start")
+        return MAIN_MENU
+    if not can_get_free_forecast(user_id):
+        await show_paywall(query.message, user_id)
+        return MAIN_MENU
+    ecl = ecls[idx]
+    etype, kind, date_str, sign, deg, jd_max, lon = ecl
+    tname = "🌑 солнечное затмение" if etype == "СЗ" else "🌕 лунное затмение"
+    name = context.user_data.get("name", "")
+    await query.edit_message_text(
+        f"выбрано: {tname} ({kind}) {date_str} — {sign} {deg}°\n\n✨ считаю карту и готовлю разбор...\n🔮 займёт около минуты"
+    )
+    chart = chart_for(context.user_data)
+    if "error" in chart:
+        await query.message.reply_text(f"ошибка расчёта: {chart['error']}\n/start")
+        return MAIN_MENU
+    _cache_retro_flag(user_id, context, chart.get("_retrograde", []))
+    increment_forecast_counter(user_id)
+    # дом затмения — из кода, факт
+    house = get_house(lon, chart.get("_cusps"))
+    header = f"{tname} ({kind})\n📅 {date_str} — {SIGNS_EMOJI.get(sign,'')}{sign} {deg}°, *{house} дом* твоей карты\n\n"
+    forecast = await get_eclipse_forecast(name, chart, ecl)
+    await query.message.reply_text(header + forecast, parse_mode="Markdown")
+    used = get_free_used(user_id)
+    limit = get_free_limit(user_id)
+    remaining = limit - used
+    keyboard = [
+        [InlineKeyboardButton("🌘 другое затмение", callback_data="menu_eclipse")],
+        [InlineKeyboardButton("← главное меню", callback_data="back_to_menu")],
+    ]
+    footer = f"\n\n_осталось бесплатных прогнозов: {max(0, remaining)}_"
+    await query.message.reply_text("хочешь перейти в другой прогноз?" + footer, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return MAIN_MENU
+
 async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user_id = update.effective_user.id
@@ -881,11 +1093,7 @@ async def handle_lunation_choice(update: Update, context: ContextTypes.DEFAULT_T
         f"выбрано: {type_name} {date} — {sign} {deg}°\n\n✨ считаю карту и готовлю разбор...\n🔮 займёт около минуты"
     )
 
-    chart = calculate_natal_chart(
-        context.user_data.get("birth_date", ""),
-        context.user_data.get("birth_time", ""),
-        context.user_data.get("birth_city", "")
-    )
+    chart = chart_for(context.user_data)
     if "error" in chart:
         await query.message.reply_text(f"ошибка расчёта: {chart['error']}\n/start")
         return ConversationHandler.END
@@ -987,11 +1195,14 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             grant_subscription(user_id, plan_key)
             plan = SUBSCRIPTION_PLANS.get(plan_key, {})
             await notify_admin_payment(context, user_id, plan_key)
-            keyboard = [[InlineKeyboardButton("← главное меню", callback_data="back_to_menu")]]
             await query.edit_message_text(
-                f"✅ *оплата подтверждена!*\n\n*{plan.get('name','')}* активирована. спасибо! 🌙",
-                reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+                f"✅ *оплата прошла, всё супер!*\n\n"
+                f"*{plan.get('name','')}* активирована 🎉\n\n"
+                f"спасибо за доверие! теперь все прогнозы открыты — исследуй себя 🌙",
+                parse_mode="Markdown"
             )
+            # сразу показываем главное меню — можно пользоваться
+            await show_main_menu(query.message, context)
         else:
             keyboard = [
                 [InlineKeyboardButton("🔄 проверить ещё раз", callback_data=query.data)],
@@ -1018,11 +1229,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"☿ *ретроградный меркурий*\n\n{status}\n📅 {retro_info['start_date']} — {retro_info['end_date']}\n\n🔮 готовлю разбор для {name}...",
             parse_mode="Markdown"
         )
-        chart = calculate_natal_chart(
-            context.user_data.get("birth_date", ""),
-            context.user_data.get("birth_time", ""),
-            context.user_data.get("birth_city", "")
-        )
+        chart = chart_for(context.user_data)
         if "error" in chart:
             await query.message.reply_text(f"ошибка расчёта: {chart['error']}")
             return MAIN_MENU
@@ -1047,11 +1254,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # движение солнца — всегда бесплатно, не считается в лимит
         name = context.user_data.get("name", "")
         await query.edit_message_text("☀️ смотрю где сейчас твоё солнце...")
-        chart = calculate_natal_chart(
-            context.user_data.get("birth_date", ""),
-            context.user_data.get("birth_time", ""),
-            context.user_data.get("birth_city", "")
-        )
+        chart = chart_for(context.user_data)
         if "error" in chart:
             await query.message.reply_text(f"ошибка расчёта: {chart['error']}")
             return MAIN_MENU
@@ -1071,14 +1274,16 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif query.data == "menu_lunation":
         return await show_lunation_choice(query.message, context, edit=True)
 
+    elif query.data == "menu_eclipse":
+        return await show_eclipse_choice(query.message, context, edit=True)
+
+    elif query.data.startswith("ecl_"):
+        return await handle_eclipse_choice(update, context)
+
     elif query.data == "menu_bonus":
         name = context.user_data.get("name", "")
         await query.edit_message_text("⚡️ считаю ретроградные планеты в твоей карте...")
-        chart = calculate_natal_chart(
-            context.user_data.get("birth_date", ""),
-            context.user_data.get("birth_time", ""),
-            context.user_data.get("birth_city", "")
-        )
+        chart = chart_for(context.user_data)
         if "error" in chart:
             await query.message.reply_text(f"ошибка расчёта: {chart['error']}")
             return MAIN_MENU
@@ -1141,7 +1346,17 @@ async def get_birth_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     city = update.message.text.strip()
+    await update.message.reply_text("🔍 ищу твой город...")
+    # ищем координаты ОДИН РАЗ при регистрации и сохраняем навсегда
+    lat, lon = await asyncio.to_thread(get_coordinates, city)
+    if lat is None:
+        await update.message.reply_text(
+            "не нашла такой город 😔 попробуй написать иначе — например, с областью:\n«никольск пензенская область»"
+        )
+        return BIRTH_CITY
     context.user_data["birth_city"] = city
+    context.user_data["lat"] = lat
+    context.user_data["lon"] = lon
     user_id = update.effective_user.id
     context.user_data["tg_id"] = user_id
     save_user(user_id, {
@@ -1149,6 +1364,8 @@ async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "birth_date": context.user_data["birth_date"],
         "birth_time": context.user_data["birth_time"],
         "birth_city": city,
+        "lat": lat,
+        "lon": lon,
         "consent_at": context.user_data.get("consent_at", ""),
         "tg_id": user_id,
         "free_forecasts_used": 0,
@@ -1270,6 +1487,86 @@ async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text[i:i+3500], parse_mode="Markdown")
 
 
+# ── ПРОМОКОДЫ ────────────────────────────────────────────────────
+async def activate_promo(context, user_id, code) -> str:
+    """Активирует промокод. Возвращает текст ответа пользователю."""
+    promos = load_promos()
+    promo = promos.get(code)
+    if not promo:
+        return "такого промокода нет 😔 проверь написание."
+    if user_id in promo.get("used_by", []):
+        return "ты уже активировала этот промокод 🌙"
+    if promo.get("uses_left", 0) <= 0:
+        return "этот промокод уже исчерпан 😔"
+    # активируем год безлимита
+    data = load_user_data()
+    uid = str(user_id)
+    if uid not in data:
+        data[uid] = {}
+    now = datetime.now(timezone.utc)
+    data[uid].setdefault("subscriptions", {})["full_year"] = (now + timedelta(days=365)).isoformat()
+    save_user_data(data)
+    promo["uses_left"] = promo.get("uses_left", 0) - 1
+    promo.setdefault("used_by", []).append(user_id)
+    save_promos(promos)
+    # уведомляем админа
+    if ADMIN_ID:
+        user = get_user(user_id) or {}
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"🎁 промокод {code} активирован!\n👤 {user.get('name','—')} (id {user_id})\nосталось использований: {promo['uses_left']}"
+            )
+        except Exception:
+            pass
+    return "🎁 *промокод активирован!*\n\nу тебя целый год безлимита — все прогнозы открыты 🎉\n\nисследуй себя 🌙"
+
+async def promo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Активация промокода: /promo КОД"""
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("введи код после команды, например:\n/promo LUNA2026")
+        return
+    code = context.args[0].strip().upper()
+    result_text = await activate_promo(context, user_id, code)
+    await update.message.reply_text(result_text, parse_mode="Markdown")
+    if "активирован" in result_text:
+        context.user_data.update(get_user(user_id) or {})
+        await show_main_menu(update.message, context)
+
+async def promo_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание промокода (админ): /promo_add КОД [кол-во использований]"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("формат: /promo_add КОД [сколько раз можно использовать]\nнапример: /promo_add ЛУНА2026 5")
+        return
+    code = context.args[0].strip().upper()
+    uses = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 1
+    promos = load_promos()
+    promos[code] = {"plan": "full_year", "uses_left": uses, "used_by": []}
+    save_promos(promos)
+    await update.message.reply_text(
+        f"✅ промокод создан!\n\nкод: `{code}`\nдаёт: год безлимита\nиспользований: {uses}\n\n"
+        f"человек активирует его так:\n/promo {code}",
+        parse_mode="Markdown"
+    )
+
+async def promo_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список промокодов (админ): /promo_list"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    promos = load_promos()
+    if not promos:
+        await update.message.reply_text("промокодов пока нет. создай: /promo_add КОД 5")
+        return
+    lines = ["🎁 *промокоды*\n"]
+    for code, p in promos.items():
+        used = len(p.get("used_by", []))
+        lines.append(f"`{code}` — осталось {p.get('uses_left',0)}, активировали {used}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # ── ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ─────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("ошибка в обработчике:", exc_info=context.error)
@@ -1308,6 +1605,9 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("payments", payments_cmd))
+    app.add_handler(CommandHandler("promo", promo_cmd))
+    app.add_handler(CommandHandler("promo_add", promo_add_cmd))
+    app.add_handler(CommandHandler("promo_list", promo_list_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_error_handler(error_handler)
 
