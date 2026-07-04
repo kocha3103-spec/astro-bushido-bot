@@ -5,3 +5,4 @@ geopy
 httpx
 yookassa
 chromadb-client
+aiohttp
