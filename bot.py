@@ -37,6 +37,11 @@ if YOOKASSA_SHOP_ID and YOOKASSA_SECRET:
     Configuration.account_id = YOOKASSA_SHOP_ID
     Configuration.secret_key = YOOKASSA_SECRET
 
+# Продамус: ссылка платёжной страницы вида https://твойшоп.payform.ru
+PRODAMUS_URL = os.environ.get("PRODAMUS_URL", "").rstrip("/")
+PRODAMUS_SECRET = os.environ.get("PRODAMUS_SECRET", "")
+WEBHOOK_PORT = int(os.environ.get("PORT", "8080"))
+
 SUBSCRIPTION_PLANS = {
     "full_year": {
         "name": "✨ безлимит на весь год",
@@ -222,6 +227,88 @@ def check_payment(payment_id: str) -> bool:
         return payment.status == "succeeded"
     except Exception:
         return False
+
+
+# ── ПРОДАМУС ─────────────────────────────────────────────────────
+def create_prodamus_link(user_id: int, plan_key: str):
+    """Собирает ссылку на оплату Продамус. Возвращает (url, order_id)."""
+    from urllib.parse import urlencode
+    plan = SUBSCRIPTION_PLANS[plan_key]
+    order_id = f"{user_id}-{plan_key}-{uuid4().hex[:8]}"
+    params = {
+        "order_id": order_id,
+        "products[0][name]": f"Информационные услуги: {plan['name']}",
+        "products[0][price]": plan["price"],
+        "products[0][quantity]": "1",
+        "customer_extra": str(user_id),
+        "do": "pay",
+    }
+    return f"{PRODAMUS_URL}/?{urlencode(params)}", order_id
+
+
+async def prodamus_webhook(request):
+    """Продамус присылает сюда уведомление об оплате. Активируем подписку сами."""
+    from aiohttp import web
+    try:
+        data = dict(await request.post())
+        logger.info(f"prodamus webhook: order={data.get('order_id')} status={data.get('payment_status')}")
+        if data.get("payment_status") != "success":
+            return web.Response(text="OK")
+        order_id = data.get("order_id", "")
+        parts = order_id.split("-", 2)
+        if len(parts) < 2:
+            return web.Response(text="OK")
+        user_id, plan_key = parts[0], parts[1]
+        plan = SUBSCRIPTION_PLANS.get(plan_key)
+        if not plan or not user_id.isdigit():
+            return web.Response(text="OK")
+        user_id = int(user_id)
+        # защита: сумма должна совпадать с тарифом
+        paid_sum = str(data.get("sum", "")).strip()
+        if paid_sum and float(paid_sum) + 0.01 < float(plan["price"]):
+            logger.warning(f"prodamus: сумма {paid_sum} меньше тарифа {plan['price']} — не активирую")
+            return web.Response(text="OK")
+        # не активируем дважды один и тот же заказ
+        saved = get_user(user_id) or {}
+        if order_id in saved.get("paid_orders", []):
+            return web.Response(text="OK")
+        grant_subscription(user_id, plan_key)
+        data_all = load_user_data()
+        data_all.setdefault(str(user_id), {}).setdefault("paid_orders", []).append(order_id)
+        save_user_data(data_all)
+        bot = request.app["bot"]
+        await notify_admin_payment_bot(bot, user_id, plan_key)
+        try:
+            await bot.send_message(
+                user_id,
+                f"✅ оплата прошла, всё супер!\n\n{plan['name']} активирована 🎉\n\n"
+                f"спасибо за доверие! все прогнозы открыты — жми /start и исследуй себя 🌙"
+            )
+        except Exception as e:
+            logger.warning(f"prodamus notify user {user_id}: {e}")
+        return web.Response(text="OK")
+    except Exception as e:
+        logger.error(f"prodamus webhook error: {e}")
+        return web.Response(text="OK")
+
+
+async def start_webhook_server(app_tg):
+    """Поднимает мини-сервер для уведомлений Продамуса рядом с ботом."""
+    if not PRODAMUS_URL:
+        return
+    try:
+        from aiohttp import web
+        webapp = web.Application()
+        webapp["bot"] = app_tg.bot
+        webapp.router.add_post("/prodamus", prodamus_webhook)
+        webapp.router.add_get("/", lambda r: web.Response(text="alive"))
+        runner = web.AppRunner(webapp)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+        await site.start()
+        logger.info(f"prodamus webhook слушает порт {WEBHOOK_PORT}")
+    except Exception as e:
+        logger.error(f"не удалось поднять webhook-сервер: {e}")
 
 
 # ── АСТРО-РАСЧЁТЫ ─────────────────────────────────────────────────
@@ -1153,6 +1240,22 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         plan = SUBSCRIPTION_PLANS.get(plan_key)
         if not plan:
             return MAIN_MENU
+        # Продамус — приоритетный способ (чеки в налоговую идут автоматически)
+        if PRODAMUS_URL:
+            pay_url, order_id = create_prodamus_link(user_id, plan_key)
+            saved = get_user(user_id) or {}
+            saved["pending_order_id"] = order_id
+            save_user(user_id, saved)
+            keyboard = [
+                [InlineKeyboardButton(f"💳 оплатить {plan['label']}", url=pay_url)],
+                [InlineKeyboardButton("← назад", callback_data="menu_buy")],
+            ]
+            await query.edit_message_text(
+                f"*{plan['name']}*\n\n{plan['desc']}\n\nстоимость: *{plan['label']}*\n\n"
+                f"после оплаты доступ откроется автоматически в течение минуты — я пришлю сообщение 🌙",
+                reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+            )
+            return MAIN_MENU
         # оплата ещё не подключена
         if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET):
             keyboard = [
@@ -1422,8 +1525,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def notify_admin_payment(context, user_id, plan_key):
-    """Мгновенное уведомление админу о новой оплате."""
+async def notify_admin_payment_bot(bot, user_id, plan_key):
+    """Мгновенное уведомление админу о новой оплате (через объект bot)."""
     if not ADMIN_ID:
         return
     user = get_user(user_id) or {}
@@ -1431,7 +1534,7 @@ async def notify_admin_payment(context, user_id, plan_key):
     plan = SUBSCRIPTION_PLANS.get(plan_key, {})
     when = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     try:
-        await context.bot.send_message(
+        await bot.send_message(
             ADMIN_ID,
             f"💰 новая оплата!\n\n"
             f"👤 {name} (id {user_id})\n"
@@ -1440,6 +1543,9 @@ async def notify_admin_payment(context, user_id, plan_key):
         )
     except Exception as e:
         logger.warning(f"admin payment notify: {e}")
+
+async def notify_admin_payment(context, user_id, plan_key):
+    await notify_admin_payment_bot(context.bot, user_id, plan_key)
 
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список пользователей — только для админа."""
@@ -1585,7 +1691,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ЗАПУСК ───────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(start_webhook_server).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
