@@ -1753,7 +1753,19 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ЗАПУСК ───────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(start_webhook_server).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        # щедрые таймауты — сеть до telegram может быть медленной
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(60)
+        .post_init(start_webhook_server)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
