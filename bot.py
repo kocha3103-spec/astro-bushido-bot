@@ -568,6 +568,14 @@ def get_sun_transit(cusps):
 
 
 # ── CLAUDE ────────────────────────────────────────────────────────
+async def safe_reply(message, text, reply_markup=None):
+    """Отправка с Markdown; если разметка сломана — отправляем как обычный текст."""
+    from telegram.error import BadRequest
+    try:
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except BadRequest:
+        await message.reply_text(text, reply_markup=reply_markup)
+
 async def call_claude(system_prompt, user_prompt, max_tokens=1400):
     try:
         async with httpx.AsyncClient(timeout=90) as client:
@@ -1144,7 +1152,7 @@ async def handle_eclipse_choice(update: Update, context: ContextTypes.DEFAULT_TY
     house = get_house(lon, chart.get("_cusps"))
     header = f"{tname} ({kind})\n📅 {date_str} — {SIGNS_EMOJI.get(sign,'')}{sign} {deg}°, *{house} дом* твоей карты\n\n"
     forecast = await get_eclipse_forecast(name, chart, ecl)
-    await query.message.reply_text(header + forecast, parse_mode="Markdown")
+    await safe_reply(query.message, header + forecast)
     used = get_free_used(user_id)
     limit = get_free_limit(user_id)
     remaining = limit - used
@@ -1386,7 +1394,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _, sun_sign, sun_deg, sun_house = get_sun_transit(chart.get("_cusps"))
         header = f"☀️ {name}, сейчас твоё солнце в *{sun_house} доме* ({SIGNS_EMOJI.get(sun_sign,'')}{sun_sign} {sun_deg}°)\n\n"
         forecast = await get_sun_transit_forecast(name, chart)
-        await query.message.reply_text(header + forecast, parse_mode="Markdown")
+        await safe_reply(query.message, header + forecast)
         keyboard = [[InlineKeyboardButton("← вернуться в меню", callback_data="back_to_menu")]]
         await query.message.reply_text(
             "что дальше?\n\n_солнце доступно тебе всегда ☀️_",
@@ -1810,4 +1818,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
