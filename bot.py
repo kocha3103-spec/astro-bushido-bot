@@ -1692,6 +1692,48 @@ async def promo_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"`{code}` — осталось {p.get('uses_left',0)}, активировали {used}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шпаргалка по командам: /help"""
+    user_lines = [
+        "🌙 *команды бота*\n",
+        "/start — запуск / главное меню",
+        "/reset — удалить свои данные и начать заново",
+        "/cancel — отменить текущий ввод",
+    ]
+    admin_lines = [
+        "\n👑 *только для тебя (админ)*\n",
+        "/stats — статистика: пользователи, прогнозы, оплаты",
+        "/users — список пользователей с данными",
+        "/payments — все оплаты по времени",
+        "/promo\\_add КОД 5 — создать промокод (год безлимита, 5 использований)",
+        "/promo\\_list — все промокоды и их остатки",
+        "/promo КОД — активировать промокод (эта команда есть и у пользователей, но о ней знают только те, кому дала код)",
+        "/rag — проверить, подключены ли авторские материалы",
+        "/help — эта шпаргалка",
+        "\n📩 *приходят автоматически:*",
+        "💰 уведомление о каждой оплате",
+        "🎁 уведомление об активации промокода",
+    ]
+    lines = user_lines + (admin_lines if update.effective_user.id == ADMIN_ID else [])
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def rag_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка подключения авторских материалов (админ): /rag"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text("🔍 проверяю подключение к базе материалов...")
+    result = await asyncio.to_thread(retrieve, "новолуние луна дом")
+    if result:
+        preview = result[:400]
+        await update.message.reply_text(
+            f"✅ материалы подключены!\n\nнайдено {len(result)} символов контекста.\n\nначало ответа:\n\n{preview}..."
+        )
+    else:
+        await update.message.reply_text(
+            "❌ материалы НЕ подключены — база не отвечает или ключ неверный.\n\n"
+            "проверь переменную CHROMA_API_KEY на сервере. прогнозы сейчас идут без авторских материалов!"
+        )
+
 
 # ── ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ─────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1734,6 +1776,8 @@ def main():
     app.add_handler(CommandHandler("promo", promo_cmd))
     app.add_handler(CommandHandler("promo_add", promo_add_cmd))
     app.add_handler(CommandHandler("promo_list", promo_list_cmd))
+    app.add_handler(CommandHandler("rag", rag_check_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_error_handler(error_handler)
 
