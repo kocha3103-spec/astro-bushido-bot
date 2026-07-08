@@ -293,22 +293,25 @@ async def prodamus_webhook(request):
 
 
 async def start_webhook_server(app_tg):
-    """Поднимает мини-сервер для уведомлений Продамуса рядом с ботом."""
-    if not PRODAMUS_URL:
-        return
+    """Мини-сервер: health-check для хостинга (всегда) + вебхук Продамуса."""
     try:
         from aiohttp import web
+
+        async def health(request):
+            return web.Response(text="alive")
+
         webapp = web.Application()
         webapp["bot"] = app_tg.bot
+        webapp.router.add_get("/", health)
+        webapp.router.add_get("/health", health)
         webapp.router.add_post("/prodamus", prodamus_webhook)
-        webapp.router.add_get("/", lambda r: web.Response(text="alive"))
         runner = web.AppRunner(webapp)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
         await site.start()
-        logger.info(f"prodamus webhook слушает порт {WEBHOOK_PORT}")
+        logger.info(f"web-сервер слушает порт {WEBHOOK_PORT} (health + prodamus webhook)")
     except Exception as e:
-        logger.error(f"не удалось поднять webhook-сервер: {e}")
+        logger.error(f"не удалось поднять web-сервер: {e}")
 
 
 # ── АСТРО-РАСЧЁТЫ ─────────────────────────────────────────────────
@@ -1254,6 +1257,23 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"*{plan['name']}*\n\n{plan['desc']}\n\nстоимость: *{plan['label']}*\n\n"
                 f"после оплаты доступ откроется автоматически в течение минуты — я пришлю сообщение 🌙",
                 reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+            )
+            return MAIN_MENU
+        # Продамус — основной способ оплаты
+        if PRODAMUS_URL:
+            url, order_id = create_prodamus_link(user_id, plan_key)
+            saved = get_user(user_id) or {}
+            saved["pending_order_id"] = order_id
+            save_user(user_id, saved)
+            keyboard = [
+                [InlineKeyboardButton(f"💳 оплатить {plan['label']}", url=url)],
+                [InlineKeyboardButton("← назад", callback_data="menu_buy")],
+            ]
+            await query.edit_message_text(
+                f"*{plan['name']}*\n\n{plan['desc']}\n\nстоимость: *{plan['label']}*\n\n"
+                f"после оплаты всё активируется автоматически в течение минуты — я пришлю подтверждение 🌙",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
             )
             return MAIN_MENU
         # оплата ещё не подключена
