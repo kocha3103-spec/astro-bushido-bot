@@ -1805,7 +1805,9 @@ def main():
         logger.warning("job_queue недоступен — уведомления отключены. добавь python-telegram-bot[job-queue] в requirements.")
 
     print("🌙 astro bushido bot запущен")
-    app.run_polling()
+    # bootstrap_retries=-1: при таймауте сети не падаем, а пробуем подключиться снова
+    app.run_polling(bootstrap_retries=-1)
 
 if __name__ == "__main__":
     main()
+
